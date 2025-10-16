@@ -1,109 +1,130 @@
+import os
+import requests
+import json
+import time
 import streamlit as st
-from analyzer import SimpleAnalyzer
 import pandas as pd
 import plotly.express as px
 import hashlib
 
-st.set_page_config(page_title="CRM-дэшборд | Bitrix24 + Perplexity", page_icon="🤖", layout="wide")
-
-# ===== ПРОСТАЯ АВТОРИЗАЦИЯ =====
+# ================= AUTHENTICATION ===================
 def check_password():
-    """Возвращает True если пароль правильный"""
     def password_entered():
-        """Проверяет пароль"""
-        if (st.session_state["username"] == "admin" and 
-            hashlib.sha256(st.session_state["password"].encode()).hexdigest() == 
-            "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"):  # admin123
+        if (st.session_state["username"] == "admin" and
+            hashlib.sha256(st.session_state["password"].encode()).hexdigest()
+            == "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"):
             st.session_state["password_correct"] = True
-            del st.session_state["password"]  # Удаляем пароль из памяти
+            del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
 
     if "password_correct" not in st.session_state:
-        # Первый запуск - показываем форму входа
         st.markdown("### 🔐 Вход в систему")
         st.text_input("Логин", key="username")
         st.text_input("Пароль", type="password", key="password", on_change=password_entered)
         return False
     elif not st.session_state["password_correct"]:
-        # Неправильный пароль
         st.markdown("### 🔐 Вход в систему")
         st.text_input("Логин", key="username")
         st.text_input("Пароль", type="password", key="password", on_change=password_entered)
         st.error("❌ Неверный логин или пароль")
         return False
-    else:
-        # Пароль правильный
-        return True
+    return True
 
 if not check_password():
     st.stop()
-
-# ===== ГЛАВНЫЙ ДЭШБОРД =====
-st.title("🤖 Аналитика CRM | Bitrix24 + Perplexity")
-
-# Кнопка выхода
 if st.sidebar.button("Выйти"):
     st.session_state["password_correct"] = False
-    st.rerun()
+    st.experimental_rerun()
 
-st.sidebar.success("✅ Вы вошли в систему")
+# ================= BITRIX + PERPLEXITY LOGIC ===================
+BITRIX24_WEBHOOK = os.getenv("BITRIX24_WEBHOOK")
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
 
-@st.cache_resource
-def load_analyzer():
-    return SimpleAnalyzer()
+if not BITRIX24_WEBHOOK or not PERPLEXITY_API_KEY:
+    st.error("❌ Настройки Secrets: задайте BITRIX24_WEBHOOK и PERPLEXITY_API_KEY")
+    st.stop()
 
-analyzer = load_analyzer()
+def get_deals(date_from=None, date_to=None, limit=50, pause_sec=1.0):
+    deals, start = [], 0
+    params = {"select[]": [
+        "ID","TITLE","STAGE_ID","OPPORTUNITY","ASSIGNED_BY_ID",
+        "DATE_CREATE","DATE_MODIFY","LAST_ACTIVITY_TIME","PROBABILITY"
+    ]}
+    if date_from: params["filter[>=DATE_CREATE]"] = date_from
+    if date_to:   params["filter[<=DATE_CREATE]"] = date_to
 
-st.sidebar.title("Фильтры данных")
-date_from = st.sidebar.date_input("C какой даты?", pd.Timestamp.today() - pd.Timedelta(days=30))
-date_to = st.sidebar.date_input("По какую дату?", pd.Timestamp.today())
+    while True:
+        params["start"] = start
+        r = requests.get(BITRIX24_WEBHOOK.rstrip("/") + "/crm.deal.list.json", params=params)
+        res = r.json()
+        if not res.get("result"): break
+        deals.extend(res["result"])
+        if len(deals) >= limit or len(res["result"]) < 50: break
+        start += 50
+        time.sleep(pause_sec)
+    return deals[:limit]
 
-with st.spinner("Загружаю сделки с Bitrix24..."):
-    deals = analyzer.get_deals(
-        date_from=str(date_from),
-        date_to=str(date_to),
-        limit=50
-    )
+def run_ai_analysis(deals):
+    if not deals:
+        return {"health_score":0,"summary":"Нет данных","recommendations":["Добавьте сделки"]}
+    sample = deals[:10]
+    prompt = f"""
+Ты эксперт по CRM. Сделок: {len(deals)}. Примеры: {json.dumps(sample,ensure_ascii=False,indent=2)}
+Ответ в JSON: {{"health_score":0,"summary":"","recommendations":[]}}
+    """
+    data = {
+        "model":"sonar-pro",
+        "messages":[{"role":"system","content":"JSON"}, {"role":"user","content":prompt}],
+        "max_tokens":500, "temperature":0.2
+    }
+    resp = requests.post(PERPLEXITY_API_URL, headers={"Authorization":f"Bearer {PERPLEXITY_API_KEY}"}, json=data)
+    text = resp.json().get("choices",[{}])[0].get("message",{}).get("content","")
+    start,end = text.find("{"),text.rfind("}")+1
+    try: return json.loads(text[start:end])
+    except: return {"health_score":0,"summary":"Ошибка анализа","recommendations":[]}
+
+# ================= STREAMLIT UI ===================
+st.set_page_config(page_title="CRM-дэшборд", page_icon="🤖", layout="wide")
+st.title("🤖 Аналитика CRM | Bitrix24 + Perplexity")
+
+st.sidebar.success("✅ Вы вошли")
+st.sidebar.title("Фильтры")
+date_from = st.sidebar.date_input("С какой даты?", pd.Timestamp.today()-pd.Timedelta(30))
+date_to   = st.sidebar.date_input("По какую дату?", pd.Timestamp.today())
+if st.sidebar.button("Обновить"):
+    pass
+
+with st.spinner("Загрузка..."):
+    deals = get_deals(str(date_from), str(date_to), limit=50)
 
 if not deals:
-    st.warning("В Битрикс24 нет ни одной сделки за выбранный период.")
+    st.warning("Нет сделок за период")
     st.stop()
 
 df = pd.DataFrame(deals)
-df['OPPORTUNITY'] = pd.to_numeric(df['OPPORTUNITY'], errors='coerce').fillna(0)
-df['DATE_CREATE'] = pd.to_datetime(df['DATE_CREATE'], errors='coerce')
-df['DATE_MODIFY'] = pd.to_datetime(df['DATE_MODIFY'], errors='coerce')
+df["OPPORTUNITY"] = pd.to_numeric(df["OPPORTUNITY"], errors="coerce").fillna(0)
+df["DATE_CREATE"]  = pd.to_datetime(df["DATE_CREATE"], errors="coerce")
+df["DATE_MODIFY"]  = pd.to_datetime(df["DATE_MODIFY"], errors="coerce")
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Всего сделок", len(df))
-col2.metric("Общий объём, ₽", f"{int(df['OPPORTUNITY'].sum()):,}")
-col3.metric("Средний чек, ₽", f"{int(df['OPPORTUNITY'].mean()):,}")
-col4.metric("Обновлено", str(df['DATE_MODIFY'].max())[:19])
+col1,col2,col3,col4 = st.columns(4)
+col1.metric("Сделок", len(df))
+col2.metric("Объём, ₽", f"{int(df.OPPORTUNITY.sum()):,}")
+col3.metric("Средний, ₽", f"{int(df.OPPORTUNITY.mean()):,}")
+col4.metric("Обновлено", str(df.DATE_MODIFY.max())[:19])
 
-st.subheader("📊 Распределение по этапам")
-fig = px.bar(
-    df.groupby('STAGE_ID').agg({'OPPORTUNITY': 'sum', 'ID': 'count'}).reset_index(),
-    x='STAGE_ID', y='OPPORTUNITY', text='ID',
-    labels={'STAGE_ID': "Этап", "OPPORTUNITY": "Сумма, ₽", "ID": "Сделок"}
-)
+st.subheader("Этапы")
+fig=px.bar(df.groupby("STAGE_ID").agg({"OPPORTUNITY":"sum","ID":"count"}).reset_index(),
+           x="STAGE_ID",y="OPPORTUNITY",text="ID")
 st.plotly_chart(fig, use_container_width=True)
 
-st.subheader("📋 Таблица сделок")
-st.dataframe(
-    df[['ID', 'TITLE', 'STAGE_ID', 'OPPORTUNITY', 'DATE_CREATE', 'DATE_MODIFY']]
-    .sort_values("DATE_CREATE", ascending=False),
-    height=300
-)
+st.subheader("Таблица")
+st.dataframe(df[["ID","TITLE","STAGE_ID","OPPORTUNITY","DATE_CREATE","DATE_MODIFY"]].sort_values("DATE_CREATE",False))
 
-st.subheader("🤖 AI-анализ от Perplexity")
-if st.button("🚀 Запустить анализ"):
-    with st.spinner("AI думает..."):
-        result = analyzer.run_ai_analysis(deals)
-        st.success(f"💯 Оценка: **{result.get('health_score', 'N/A')}%**")
-        st.info(result.get("summary", ""))
-        st.markdown("**📝 Рекомендации:**")
-        for rec in result.get("recommendations", []):
-            st.write(f"✅ {rec}")
-
-st.caption("© 2025 Битрикс24 + Perplexity PRO")
+st.subheader("AI-анализ")
+if st.button("Анализ"):
+    result = run_ai_analysis(deals)
+    st.success(f"Оценка: {result.get('health_score','N/A')}%")
+    st.info(result.get("summary",""))
+    for r in result.get("recommendations",[]): st.write(f"• {r}")

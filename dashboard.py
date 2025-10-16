@@ -23,7 +23,8 @@ authenticator = stauth.Authenticate(
     cookie_expiry_days=7
 )
 
-name, authentication_status, username = authenticator.login("🔐 Вход в систему", "main")
+# ИСПРАВЛЕНИЕ: убрали второй аргумент "main" - он больше не нужен
+name, authentication_status, username = authenticator.login(fields={'Form name': '🔐 Вход в систему'})
 
 if authentication_status == False:
     st.error("❌ Неверный логин или пароль")
@@ -93,3 +94,5 @@ if st.button("🚀 Запустить анализ"):
         st.markdown("**📝 Рекомендации:**")
         for rec in result.get("recommendations", []):
             st.write(f"✅ {rec}")
+
+st.caption("© 2025 Битрикс24 + Perplexity PRO")

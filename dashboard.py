@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-БУРМАШ · CRM Дэшборд (v3.2 — бело/оранж/чёрная тема, логотип, адаптивный порядок этапов, sales-only)
+БУРМАШ · CRM Дэшборд (v3.3 — подсказчик РОПу: Quick Wins / Stop List; без логотипа)
 """
 
 import os
@@ -43,7 +43,6 @@ div[data-testid="stMetricValue"]{ font-size:22px !important; }
 .grid2{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
 .grid3{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; }
 .headerbar{ display:flex; align-items:center; gap:16px; margin-bottom:8px; }
-.headerbar img{ height:38px; }
 </style>
 """
 st.markdown(THEME_CSS, unsafe_allow_html=True)
@@ -83,7 +82,6 @@ def get_secret(name, default=None):
     return os.getenv(name, default)
 
 BITRIX24_WEBHOOK = (get_secret("BITRIX24_WEBHOOK", "") or "").strip()
-LOGO_PATH = "/mnt/data/burmash-logo-rgb-01.png"
 
 # ------------------------
 # Bitrix24 helpers
@@ -153,28 +151,14 @@ def bx_get_open_activities_for_deal_ids(deal_ids):
 # ---- ЭТАПЫ/СТАТУСЫ: адаптивный порядок и названия ----
 @st.cache_data(ttl=600)
 def bx_get_stage_map(stage_ids):
-    """
-    Возвращает:
-    - sort_map: {STAGE_ID -> SORT:int}
-    - name_map: {STAGE_ID -> NAME:str}
-    Пытается тянуть crm.status.list по нужным категориям.
-    """
     sort_map, name_map = {}, {}
-
     if not BITRIX24_WEBHOOK or not stage_ids:
         return sort_map, name_map
-
-    # категории по префиксу "C{ID}:"
     cats = set()
     for sid in stage_ids:
         if isinstance(sid, str) and sid.startswith("C"):
-            try:
-                cid = int(sid.split(":")[0][1:])
-                cats.add(cid)
-            except Exception:
-                pass
-
-    # базовая (дефолтная) воронка
+            try: cats.add(int(sid.split(":")[0][1:]))
+            except: pass
     try:
         base = _bx_get("crm.status.list", {"filter[ENTITY_ID]":"DEAL_STAGE"})
         for s in base:
@@ -182,8 +166,6 @@ def bx_get_stage_map(stage_ids):
             name_map[s.get("STATUS_ID")] = s.get("NAME") or s.get("STATUS_ID")
     except Exception:
         pass
-
-    # по конкретным категориям
     for cid in cats:
         try:
             resp = _bx_get("crm.status.list", {"filter[ENTITY_ID]": f"DEAL_STAGE_{cid}"})
@@ -192,7 +174,6 @@ def bx_get_stage_map(stage_ids):
                 name_map[s.get("STATUS_ID")] = s.get("NAME") or s.get("STATUS_ID")
         except Exception:
             continue
-
     return sort_map, name_map
 
 # ------------------------
@@ -254,6 +235,7 @@ def compute_health_scores(df, open_tasks_map, stuck_days=5):
         })
     return pd.DataFrame(rows)
 
+# --- План действий (коротко) ---
 def deal_recommendations(row):
     recs = []
     if row["flag_lost"]:
@@ -272,30 +254,96 @@ def deal_recommendations(row):
         recs.append("Продолжайте по этапу: подтвердите следующую встречу и зафиксируйте договорённости.")
     return recs
 
-def activity_series(row, points=60):
-    end = to_dt(pd.Timestamp.utcnow())
-    start = row["DATE_CREATE"] if pd.notna(row["DATE_CREATE"]) else end - pd.Timedelta(days=30)
-    start = to_dt(start)
-    if not pd.notna(start) or start >= end:
-        start = end - pd.Timedelta(days=1)
-    idx = pd.date_range(start, end, periods=max(2,int(points)))
-    y = np.random.default_rng(int(row["ID"])).normal(0.1, 0.02, size=len(idx)).clip(0,1)
-    near_start = np.argmin(np.abs(idx - start))
-    last = row["LAST_ACTIVITY_TIME"] if pd.notna(row["LAST_ACTIVITY_TIME"]) else end
-    near_last = np.argmin(np.abs(idx - to_dt(last)))
-    for i in range(len(idx)):
-        y[i] += 0.4 * math.exp(-abs(i-near_start)/6)
-        y[i] += 0.8 * math.exp(-abs(i-near_last)/4)
-    return pd.DataFrame({"ts": idx, "activity": y})
+# --- Подсказчик РОПу: скоринг и ETA ---
+def focus_scores(df, horizon_days=14, min_prob=50):
+    """
+    Возвращает df с колонками:
+    - quick_score (0..100): вероятность быстрых денег
+    - eta_days (оценка дней до закрытия)
+    - drop_score (0..100): кандидат на паузу/архив
+    """
+    if df.empty:
+        return df.assign(quick_score=0.0, eta_days=np.nan, drop_score=0.0)
+
+    # нормировки
+    eps = 1e-9
+    prob = df["PROBABILITY"].clip(0, 100) / 100.0
+    health = df["health"].clip(0,100) / 100.0
+    potential = df["potential"].clip(0,100) / 100.0
+    opp = df["OPPORTUNITY"].clip(lower=0)
+    opp_norm = np.log1p(opp) / max(np.log1p(opp).max(), eps)
+
+    # близость к финалу: по stage_sort (чем больше, тем ближе к деньгам)
+    smin, smax = float(df["stage_sort"].min()), float(df["stage_sort"].max())
+    if smax - smin < eps:
+        stage_closeness = pd.Series(0.5, index=df.index)
+    else:
+        stage_closeness = (df["stage_sort"] - smin) / (smax - smin)
+    # потери не считаем «близкими»
+    stage_closeness = np.where(df["STAGE_ID"].astype(str).str.contains("LOSE", case=False, na=False), 0.0, stage_closeness)
+
+    # срочность = 1 - нормированный простой (за горизонтом обнуляем)
+    recency = 1 - (df["days_no_activity"].clip(lower=0) / max(horizon_days, 1)).clip(0,1)
+
+    # итоговый «быстрые деньги» (веса можно подправить)
+    quick = (
+        0.35*prob +
+        0.25*health +
+        0.15*recency +
+        0.15*stage_closeness +
+        0.10*opp_norm
+    )
+    quick_score = (quick*100).round(1)
+
+    # грубая ETA: чем ближе этап/здоровье/вероятность, тем меньше дней
+    eta = (30*(1-stage_closeness)*(1 - 0.5*health - 0.5*prob)).clip(lower=0)
+    eta_days = eta.round(0)
+
+    # стоп-лист: низкая вероятность/здоровье + большой простой/возраст
+    age_norm = (df["days_in_work"]/max(df["days_in_work"].max(),1)).clip(0,1)
+    noact_norm = (df["days_no_activity"]/max(df["days_no_activity"].max(),1)).clip(0,1)
+    drop = (1-prob)*0.4 + (1-health)*0.3 + noact_norm*0.2 + age_norm*0.1
+    drop_score = (drop*100).round(1)
+
+    out = df.copy()
+    out["quick_score"] = quick_score
+    out["eta_days"] = eta_days
+    out["drop_score"] = drop_score
+
+    # маски для удобства
+    out["is_quick"] = (out["quick_score"]>=60) & (out["PROBABILITY"]>=min_prob) & (~out["flag_lost"])
+    out["is_drop"]  = (out["drop_score"]>=70) | (out["flag_lost"]) | ((out["health"]<40) & (out["days_no_activity"]>horizon_days))
+    return out
+
+def focus_next_step(row):
+    """Короткая подсказка по действию именно для фокуса РОПа."""
+    if row["flag_lost"]:
+        return "Проверить причину проигрыша, решить: вернуть в работу или закрыть."
+    stage = str(row["stage_name"])
+    if row["PROBABILITY"]>=70 and row["health"]>=70:
+        if any(k in stage.lower() for k in ["счет","invoice","финал"]):
+            return "Выставить/контролировать счёт, дедлайн оплаты, резерв производства."
+        return "Финальный созвон: согласовать условия и срок оплаты, договор/счёт сегодня."
+    if row["PROBABILITY"]>=50 and row["health"]>=60:
+        return "Назначить демо/встречу с ЛПР, зафиксировать критерии и сроки, отправить КП."
+    if row["flag_stuck"]:
+        return "Сделка застряла: звонок сегодня + письмо-резюме, вернуть активность."
+    if row["flag_no_contact"]:
+        return "Добавить ЛПР и подтвердить бюджет/сроки."
+    return "Уточнить следующий шаг и поставить задачу с датой."
 
 # ------------------------
-# Сайдбар: фильтры
+# Сайдбар: фильтры + настройки РОПа
 # ------------------------
 st.sidebar.title("Фильтры")
 date_from  = st.sidebar.date_input("С какой даты", datetime.now().date() - timedelta(days=30))
 date_to    = st.sidebar.date_input("По какую дату", datetime.now().date())
 stuck_days = st.sidebar.slider("Нет активности ≥ (дней)", 2, 21, 5)
 limit      = st.sidebar.slider("Лимит сделок (API)", 50, 3000, 600, step=50)
+
+st.sidebar.title("Настройки фокуса РОПа")
+focus_horizon = st.sidebar.slider("Горизонт фокуса (дней)", 7, 45, 14)
+focus_min_prob = st.sidebar.slider("Мин. вероятность для фокуса, %", 0, 100, 50)
 
 uploaded_offline = None
 if not BITRIX24_WEBHOOK:
@@ -315,10 +363,8 @@ with st.spinner("Загружаю данные…"):
 
         users_full = bx_get_users_full()
         departments = bx_get_departments()
-        # отделы продаж по названию
         sales_depts = [d for d in departments if "продаж" in (d.get("NAME","").lower())]
         sales_dept_ids = {int(d["ID"]) for d in sales_depts}
-        # флаги сайдбара
         default_sales_only = bool(sales_dept_ids)
         show_sales_only = st.sidebar.checkbox("Только сотрудники отдела продаж", value=default_sales_only, disabled=not bool(users_full))
         selected_depts = st.sidebar.multiselect(
@@ -363,23 +409,14 @@ with st.spinner("Загружаю данные…"):
     stage_ids = df_scores["STAGE_ID"].dropna().unique().tolist()
     sort_map, name_map = bx_get_stage_map(stage_ids)
 
-    # запасной порядок — если не удалось получить из Битрикс
-    FALLBACK_ORDER = [
-        "NEW","NEW_LEAD","PREPARATION","PREPAYMENT_INVOICE","EXECUTING","FINAL_INVOICE","WON","LOSE","LOSE_REASON"
-    ]
+    FALLBACK_ORDER = ["NEW","NEW_LEAD","PREPARATION","PREPAYMENT_INVOICE","EXECUTING","FINAL_INVOICE","WON","LOSE","LOSE_REASON"]
     def fallback_sort(sid):
         sid = str(sid or "")
-        # убираем префикс "C*:" если есть
-        if ":" in sid: sid_short = sid.split(":")[1]
-        else: sid_short = sid
-        if sid_short in FALLBACK_ORDER:
-            return FALLBACK_ORDER.index(sid_short)*100
-        # оставшиеся — по алфавиту после основных
-        return 10000 + hash(sid_short)%1000
+        sid_short = sid.split(":")[1] if ":" in sid else sid
+        return (FALLBACK_ORDER.index(sid_short)*100 if sid_short in FALLBACK_ORDER else 10000 + hash(sid_short)%1000)
 
     df_scores["stage_sort"] = df_scores["STAGE_ID"].map(lambda s: sort_map.get(str(s), fallback_sort(s)))
     df_scores["stage_name"] = df_scores["STAGE_ID"].map(lambda s: name_map.get(str(s), str(s)))
-
     df_scores["manager"] = df_scores["ASSIGNED_BY_ID"].map(users_map).fillna("Неизвестно")
 
 # глобальный фильтр по менеджерам
@@ -388,19 +425,11 @@ selected_managers = st.sidebar.multiselect("Менеджеры", manager_options
 view_df = df_scores[df_scores["manager"].isin(selected_managers)] if selected_managers else df_scores.copy()
 
 # ------------------------
-# Шапка + логотип
+# Шапка
 # ------------------------
-col_logo, col_title = st.columns([1,5], vertical_alignment="center")
-with col_logo:
-    try:
-        st.image(LOGO_PATH, use_column_width=False)
-    except Exception:
-        st.markdown("<div class='pill'>БУРМАШ</div>", unsafe_allow_html=True)
-with col_title:
-    st.markdown("<div class='headerbar'><div class='pill'>Контроль отдела продаж</div></div>", unsafe_allow_html=True)
-    st.caption("Автоаудит · Пульс воронки · Зоны менеджеров · Карточки · Отчёт по сделке")
+st.markdown("<div class='headerbar'><div class='pill'>БУРМАШ · Контроль отдела продаж</div></div>", unsafe_allow_html=True)
+st.caption("Автоаудит · Пульс воронки · Зоны менеджеров · Карточки · Отчёт по сделке · Фокус руководителю")
 
-# верхние метрики
 c1,c2,c3,c4,c5 = st.columns(5, gap="small")
 with c1: st.metric("Всего сделок", int(view_df.shape[0]))
 with c2: st.metric("Объём, ₽", f"{int(view_df['OPPORTUNITY'].sum()):,}".replace(","," "))
@@ -411,9 +440,60 @@ with c5: st.metric("Суммарный потенциал", int(view_df["potenti
 # ------------------------
 # Вкладки
 # ------------------------
-tab_pulse, tab_audit, tab_managers, tab_cards, tab_deal = st.tabs([
-    "⛵ Пульс воронки", "🚧 Аудит", "👥 Менеджеры", "🗂 Карточки", "📄 Отчёт по сделке"
+tab_focus, tab_pulse, tab_audit, tab_managers, tab_cards, tab_deal = st.tabs([
+    "🎯 Фокус руководителю", "⛵ Пульс воронки", "🚧 Аудит", "👥 Менеджеры", "🗂 Карточки", "📄 Отчёт по сделке"
 ])
+
+# --- ФОКУС РОПу ---
+with tab_focus:
+    st.markdown("#### Быстрые деньги (Quick Wins)")
+    scored = focus_scores(view_df, horizon_days=focus_horizon, min_prob=focus_min_prob)
+    quick = (scored[scored["is_quick"]]
+             .sort_values(["quick_score","OPPORTUNITY"], ascending=[False, False])
+             .loc[:, ["ID","TITLE","manager","stage_name","OPPORTUNITY","PROBABILITY","health","days_no_activity","eta_days","quick_score"]]
+             .head(30))
+    if quick.empty:
+        st.info("Пока нет сделок, удовлетворяющих условиям фокуса. Попробуйте снизить порог вероятности или расширить горизонт.")
+    else:
+        st.dataframe(quick.rename(columns={
+            "TITLE":"Сделка","manager":"Ответственный","stage_name":"Этап","OPPORTUNITY":"Сумма, ₽",
+            "PROBABILITY":"Вероятность, %","health":"Здоровье, %","days_no_activity":"Без активности, дн",
+            "eta_days":"ETA, дн","quick_score":"Quick Win, баллы"
+        }), height=420)
+        st.caption("Quick Win = взвешенная оценка: вероятность, здоровье, недавняя активность, близость к финалу и сумма сделки.")
+
+    st.markdown("#### Стоит приостановить (Stop List)")
+    stop = (scored[scored["is_drop"]]
+            .sort_values(["drop_score","days_no_activity","days_in_work"], ascending=[False, False, False])
+            .loc[:, ["ID","TITLE","manager","stage_name","OPPORTUNITY","PROBABILITY","health","days_in_work","days_no_activity","drop_score"]]
+            .head(30))
+    if stop.empty:
+        st.success("Явных кандидатов на приостановку не найдено.")
+    else:
+        st.dataframe(stop.rename(columns={
+            "TITLE":"Сделка","manager":"Ответственный","stage_name":"Этап","OPPORTUNITY":"Сумма, ₽",
+            "PROBABILITY":"Вероятность, %","health":"Здоровье, %","days_in_work":"Дней в работе",
+            "days_no_activity":"Без активности, дн","drop_score":"StopScore, баллы"
+        }), height=380)
+
+    # точечные подсказки по верхним сделкам
+    st.markdown("#### Что сделать прямо сейчас")
+    top_actions = scored.sort_values("quick_score", ascending=False).head(6)
+    cols = st.columns(3, gap="medium")
+    for i, (_, r) in enumerate(top_actions.iterrows()):
+        with cols[i % 3]:
+            st.markdown(f"""
+            <div class="card">
+              <div class="title">{r['TITLE']}</div>
+              <div class="subtle">Этап: {r['stage_name']} • Отв.: {r['manager']}</div><hr/>
+              <span class="badge good">Quick Win: <b>{r['quick_score']}</b></span>
+              <span class="badge">ETA: <b>{int(r['eta_days'])} дн</b></span>
+              <span class="badge">Вероятн.: <b>{int(r['PROBABILITY'])}%</b></span>
+              <span class="badge">Сумма: <b>{int(r['OPPORTUNITY']):,} ₽</b></span>
+              <hr/>
+              <div class="subtle">👉 {focus_next_step(r)}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
 # --- ПУЛЬС ВОРОНКИ
 with tab_pulse:
@@ -564,7 +644,6 @@ with tab_deal:
     chosen_id = st.selectbox("Сделка", list(label_map.keys()), format_func=lambda x: label_map[x])
     deal = view_df[view_df["ID"]==chosen_id].iloc[0]
 
-    # верхняя строка
     a,b,c,d = st.columns([1.4,1,1,1], vertical_alignment="center")
     with a:
         st.markdown(f"<div class='title'>{deal['TITLE']}</div>", unsafe_allow_html=True)
@@ -573,7 +652,6 @@ with tab_deal:
     with c: st.markdown(f"<div class='score'>{deal['health']}</div><div class='kpi-caption'>Здоровье</div>", unsafe_allow_html=True)
     with d: st.markdown(f"<div class='kpi'>{int(deal['OPPORTUNITY'])}</div><div class='kpi-caption'>Сумма, ₽</div>", unsafe_allow_html=True)
 
-    # карточки
     left, right = st.columns(2, gap="large")
     with left:
         st.markdown("<div class='title'>Параметры</div>", unsafe_allow_html=True)
@@ -610,13 +688,11 @@ with tab_deal:
     with right:
         st.markdown("<div class='title'>Динамика и итог</div>", unsafe_allow_html=True)
         if px:
-            line = activity_series(deal)
-            fig = px.line(line, x="ts", y="activity", markers=True, color_discrete_sequence=["#ff7a00"])
-            fig.update_yaxes(visible=False)
-            fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), height=240)
-            st.markdown("<div class='card'>", unsafe_allow_html=True)
-            st.plotly_chart(fig, use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
+            line = pd.DataFrame({"ts":[deal["DATE_CREATE"], deal["LAST_ACTIVITY_TIME"]], "activity":[0.1, 1.0]}).dropna()
+            if line.shape[0] >= 1:
+                fig = px.line(line, x="ts", y="activity", markers=True, color_discrete_sequence=["#ff7a00"])
+                fig.update_yaxes(visible=False); fig.update_xaxes(title=""); fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), height=240)
+                st.markdown("<div class='card'>", unsafe_allow_html=True); st.plotly_chart(fig, use_container_width=True); st.markdown("</div>", unsafe_allow_html=True)
 
         risks_list = [name for name,flag in {
             "без задач": deal["flag_no_tasks"], "без контактов": deal["flag_no_contact"],
@@ -629,3 +705,4 @@ with tab_deal:
         """, unsafe_allow_html=True)
         recs = deal_recommendations(deal)
         st.markdown(f"<div class='card'><div class='title'>План действий</div><div class='subtle'>• {'<br/>• '.join(recs)}</div></div>", unsafe_allow_html=True)
+    

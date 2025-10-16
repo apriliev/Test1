@@ -128,8 +128,11 @@ fig = px.bar(df.groupby("STAGE_ID").agg({"OPPORTUNITY":"sum","ID":"count"}).rese
 st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("📋 Таблица")
-st.dataframe(df[["ID","TITLE","STAGE_ID","OPPORTUNITY","DATE_CREATE","DATE_MODIFY"]]
-             .sort_values("DATE_CREATE", False), height=300)
+st.dataframe(
+    df[["ID","TITLE","STAGE_ID","OPPORTUNITY","DATE_CREATE","DATE_MODIFY"]]
+    .sort_values("DATE_CREATE", ascending=False),
+    height=300
+)
 
 st.subheader("🤖 AI-анализ")
 if st.button("Запустить анализ"):

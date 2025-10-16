@@ -7,7 +7,7 @@ import pandas as pd
 import plotly.express as px
 import hashlib
 
-# ========== ПРОСТАЯ АВТОРИЗАЦИЯ ==========
+# ===== ПРОСТАЯ АВТОРИЗАЦИЯ =====
 def check_password():
     def password_entered():
         if (st.session_state["username"] == "admin" and
@@ -37,7 +37,7 @@ if st.sidebar.button("Выйти"):
     st.session_state["password_correct"] = False
     st.experimental_rerun()
 
-# ========== НАСТРОЙКИ API ==========
+# ===== API НАСТРОЙКИ =====
 BITRIX24_WEBHOOK = os.getenv("BITRIX24_WEBHOOK")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
@@ -46,7 +46,7 @@ if not BITRIX24_WEBHOOK or not PERPLEXITY_API_KEY:
     st.error("❌ Задайте BITRIX24_WEBHOOK и PERPLEXITY_API_KEY в Secrets")
     st.stop()
 
-# ========== ФУНКЦИИ ==========
+# ===== ФУНКЦИИ =====
 def get_deals(date_from=None, date_to=None, limit=50, pause_sec=1.0):
     deals, start = [], 0
     params = {"select[]": [
@@ -62,8 +62,7 @@ def get_deals(date_from=None, date_to=None, limit=50, pause_sec=1.0):
         res = r.json()
         if not res.get("result"): break
         deals.extend(res["result"])
-        if len(deals) >= limit or len(res["result"]) < 50:
-            break
+        if len(deals) >= limit or len(res["result"]) < 50: break
         start += 50
         time.sleep(pause_sec)
     return deals[:limit]
@@ -73,16 +72,17 @@ def run_ai_analysis(deals):
         return {"health_score":0,"summary":"Нет данных","recommendations":["Добавьте сделки"]}
     sample = deals[:10]
     prompt = f"""
-Ты эксперт по CRM. Сделок: {len(deals)}. Примеры: {json.dumps(sample,ensure_ascii=False,indent=2)}
-Ответ в JSON: {{"health_score":0,"summary":"","recommendations":[]}}
+Ты эксперт по CRM. Сделок: {len(deals)}. Примеры: {json.dumps(sample, ensure_ascii=False, indent=2)}
+Ответ в формате JSON с ключами health_score, summary, recommendations.
     """
     data = {
         "model":"sonar-pro",
         "messages":[
-            {"role":"system","content":"Верни JSON без лишнего текста."},
+            {"role":"system","content":"Ты даёшь строго валидный JSON без текста оберток."},
             {"role":"user","content":prompt}
         ],
-        "max_tokens":500, "temperature":0.2
+        "max_tokens":1000,
+        "temperature":0.1
     }
     resp = requests.post(PERPLEXITY_API_URL,
                          headers={"Authorization":f"Bearer {PERPLEXITY_API_KEY}"},
@@ -94,7 +94,7 @@ def run_ai_analysis(deals):
     except:
         return {"health_score":0,"summary":"Ошибка анализа","recommendations":[]}
 
-# ========== UI ==========
+# ===== UI =====
 st.set_page_config(page_title="CRM-дэшборд", page_icon="🤖", layout="wide")
 st.title("🤖 Аналитика CRM | Bitrix24 + Perplexity")
 st.sidebar.success("✅ Вы вошли")

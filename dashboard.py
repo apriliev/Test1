@@ -1,42 +1,53 @@
 import streamlit as st
-import streamlit_authenticator as stauth
 from analyzer import SimpleAnalyzer
 import pandas as pd
 import plotly.express as px
+import hashlib
 
 st.set_page_config(page_title="CRM-дэшборд | Bitrix24 + Perplexity", page_icon="🤖", layout="wide")
 
-# ===== АВТОРИЗАЦИЯ =====
-credentials = {
-    "usernames": {
-        "admin": {
-            "name": "Admin",
-            "password": "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW"  # пароль: admin123
-        }
-    }
-}
+# ===== ПРОСТАЯ АВТОРИЗАЦИЯ =====
+def check_password():
+    """Возвращает True если пароль правильный"""
+    def password_entered():
+        """Проверяет пароль"""
+        if (st.session_state["username"] == "admin" and 
+            hashlib.sha256(st.session_state["password"].encode()).hexdigest() == 
+            "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"):  # admin123
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # Удаляем пароль из памяти
+        else:
+            st.session_state["password_correct"] = False
 
-authenticator = stauth.Authenticate(
-    credentials,
-    "crm_dashboard_cookie",
-    "abcdef_random_key",
-    cookie_expiry_days=7
-)
+    if "password_correct" not in st.session_state:
+        # Первый запуск - показываем форму входа
+        st.markdown("### 🔐 Вход в систему")
+        st.text_input("Логин", key="username")
+        st.text_input("Пароль", type="password", key="password", on_change=password_entered)
+        return False
+    elif not st.session_state["password_correct"]:
+        # Неправильный пароль
+        st.markdown("### 🔐 Вход в систему")
+        st.text_input("Логин", key="username")
+        st.text_input("Пароль", type="password", key="password", on_change=password_entered)
+        st.error("❌ Неверный логин или пароль")
+        return False
+    else:
+        # Пароль правильный
+        return True
 
-# ИСПРАВЛЕНИЕ: убрали второй аргумент "main" - он больше не нужен
-name, authentication_status, username = authenticator.login(fields={'Form name': '🔐 Вход в систему'})
-
-if authentication_status == False:
-    st.error("❌ Неверный логин или пароль")
-    st.stop()
-elif authentication_status == None:
-    st.warning("⚠️ Пожалуйста, введите логин и пароль")
+if not check_password():
     st.stop()
 
 # ===== ГЛАВНЫЙ ДЭШБОРД =====
 st.title("🤖 Аналитика CRM | Bitrix24 + Perplexity")
-st.sidebar.success(f"✅ Вы вошли как: {name}")
-authenticator.logout("Выйти", "sidebar")
+
+# Кнопка выхода
+if st.sidebar.button("Выйти"):
+    st.session_state["password_correct"] = False
+    st.rerun()
+
+st.sidebar.success("✅ Вы вошли в систему")
 
 @st.cache_resource
 def load_analyzer():

@@ -62,7 +62,8 @@ def get_deals(date_from=None, date_to=None, limit=50, pause_sec=1.0):
         res = r.json()
         if not res.get("result"): break
         deals.extend(res["result"])
-        if len(deals) >= limit or len(res["result"]) < 50: break
+        if len(deals) >= limit or len(res["result"]) < 50:
+            break
         start += 50
         time.sleep(pause_sec)
     return deals[:limit]

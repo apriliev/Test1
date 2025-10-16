@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-RUBI-like CRM Dashboard (Streamlit, no-Excel build)
-- Пульс воронки, аудит, карточки сделок, зелёная/красная зоны по менеджерам
-- Источник данных: Bitrix24 (webhook) или офлайн-таблица (CSV/XLSX)
-- Экспорт: ZIP с CSV-файлами (без Excel-зависимостей)
+RUBI-like CRM Dashboard (Streamlit, v2 — менеджер-фильтр + "Отчёт как в РУБИ" + рекомендации)
+- Глобальный фильтр по менеджерам (распространяется на все вкладки)
+- "Отчёт по сделке" в стиле РУБИ ЧАТ: карточки, индикаторы, мини-график динамики, оценка коммуникации
+- Персональные рекомендации Next Best Actions по каждой сделке (правила без внешнего ИИ)
+- Источник данных: Bitrix24 (webhook) или офлайн (CSV/XLSX)
+- Экспорт: ZIP с CSV (без Excel-зависимостей)
 """
 
 import os
@@ -13,6 +15,8 @@ import hashlib
 from datetime import datetime, timedelta
 from io import BytesIO
 import zipfile
+import math
+import random
 
 import numpy as np
 import pandas as pd
@@ -32,23 +36,28 @@ st.set_page_config(page_title="RUBI-like CRM Аналитика", page_icon="�
 CUSTOM_CSS = """
 <style>
 :root { --rubi-accent:#6C5CE7; --rubi-red:#ff4d4f; --rubi-green:#22c55e; --rubi-yellow:#f59e0b; }
-.block-container { padding-top: 1.0rem; padding-bottom: 1.2rem; }
+.block-container { padding-top: 0.8rem; padding-bottom: 1.2rem; }
 .rubi-card { border-radius:18px; padding:18px 18px 12px; background:#111418; border:1px solid #222; box-shadow:0 4px 18px rgba(0,0,0,.25); }
 .rubi-title { font-weight:700; font-size:18px; margin-bottom:6px; }
 .rubi-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; border:1px solid #2a2f36; background:#0e1216; font-size:12px; margin-right:6px; margin-bottom:6px;}
 .rubi-good { color: var(--rubi-green) !important; }
 .rubi-bad  { color: var(--rubi-red) !important; }
+.rubi-warn { color: var(--rubi-yellow) !important; }
 .small { opacity:.8; font-size:12px; }
 hr { border: 0; border-top:1px solid #222; margin: 10px 0 6px }
 div[data-testid="stMetricValue"] { font-size:22px !important; }
+.kpi-number { font-weight:800; font-size:28px; }
+.kpi-caption { color:#a8b3bf; font-size:12px; margin-top:-6px }
+.score-circle { width:64px;height:64px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;background:#0f141a;border:1px solid #2b3139;font-weight:800;font-size:22px;margin-right:10px}
+.grid-3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; }
+.grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 # =========================
 # ПРОСТАЯ АВТОРИЗАЦИЯ
-# логин: admin
-# пароль: 123  (можешь заменить хэш ниже)
+# логин: admin / пароль: 123  (можешь заменить хэш ниже)
 # =========================
 def check_password():
     def password_entered():
@@ -184,7 +193,7 @@ def compute_health_scores(df, open_tasks_map, stuck_days=5):
 
         opp = float(r.get("OPPORTUNITY") or 0.0)
         prob = float(r.get("PROBABILITY") or 0.0)
-        potential = min(100, int((opp > 0) * (30 + min(70, np.log10(max(1, opp))/5 * 70)) * (0.4 + prob/100*0.6)))
+        potential = min(100, int((opp > 0) * (30 + min(70, math.log10(max(1, opp))/5 * 70)) * (0.4 + prob/100*0.6)))
 
         rows.append({
             "ID": int(r["ID"]),
@@ -221,42 +230,93 @@ def split_green_red(df_scores):
     grp["zone"] = np.where((grp["health_avg"]>=70) & (grp["no_tasks"]<=2) & (grp["stuck"]<=2), "green", "red")
     return grp
 
-def ai_summarize(company_name, df_summary, df_managers, api_key, api_url):
-    """Короткое резюме + план (Perplexity). Без ключа — возвращает stub."""
-    if not api_key:
-        return "AI-резюме недоступно (нет API-ключа).", []
-    try:
-        import requests
-        sample = df_summary.sort_values("health").head(4)[[
-            "ID","TITLE","health","potential","OPPORTUNITY","days_in_work",
-            "flag_no_tasks","flag_stuck","flag_no_company","flag_no_contact","flag_lost"
-        ]].to_dict(orient="records")
-        payload = {
-            "model": "sonar-pro",
-            "messages": [
-                {"role":"system","content":"Отвечай строго валидным JSON с ключами: summary (string), actions (string[])."},
-                {"role":"user","content": json.dumps({
-                    "company": company_name,
-                    "kpi_summary": df_managers.describe(include="all").to_dict(),
-                    "sample_deals": sample
-                }, ensure_ascii=False)}
-            ],
-            "temperature": 0.1,
-            "max_tokens": 800
-        }
-        r = requests.post(api_url, headers={"Authorization":f"Bearer {api_key}"}, json=payload, timeout=60)
-        txt = r.json().get("choices",[{}])[0].get("message",{}).get("content","")
-        i,j = txt.find("{"), txt.rfind("}")+1
-        data = json.loads(txt[i:j]) if i>=0 and j>i else {}
-        return data.get("summary","Не удалось разобрать ответ."), data.get("actions",[])
-    except Exception:
-        return "Не удалось сформировать AI-резюме.", []
+# ---------- РЕКОМЕНДАЦИИ (rule-based) ----------
+def deal_recommendations(row):
+    recs = []
+    # приоритизация
+    if row["flag_lost"]:
+        recs.append("Проверьте корректность причины проигрыша и верните сделку в работу, если есть шанс — предложите альтернативу/рассрочку.")
+        return recs
+    if row["flag_no_tasks"]:
+        recs.append("Поставьте задачу на следующий шаг с датой и комментарием. Нельзя оставлять сделку без активной задачи.")
+    if row["flag_stuck"]:
+        recs.append("Нет активности более нескольких дней — свяжитесь с клиентом сегодня: звонок + письмо с резюме договорённостей.")
+    if row["flag_no_contact"]:
+        recs.append("Добавьте контакт ЛПР (ФИО, телефон/email). Без ЛПР шанс закрытия низкий.")
+    if row["flag_no_company"]:
+        recs.append("Заполните карточку компании: ИНН, сайт, отрасль — это нужно для отчётов и сопоставления.")
+    # потенциал/здоровье
+    if row["health"] < 60 and row["potential"] >= 50:
+        recs.append("Низкое здоровье при высоком потенциале — согласуйте встречу/демо, ускорьте согласование ТЗ и КП.")
+    if row["OPPORTUNITY"] > 0 and row["PROBABILITY"] < 40:
+        recs.append("Сумма заявлена, но вероятность низкая — уточните бюджет/сроки/ЛПР, обновите вероятность.")
+    if row["days_in_work"] > 20 and row["PROBABILITY"] < 30:
+        recs.append("Долгое ведение без прогресса — либо поднимите этап и договорённости, либо жёстко переформатируйте план действий.")
+    if not recs:
+        recs.append("Продолжайте план по этапу: подтвердите следующую встречу, зафиксируйте договорённости в комментарии.")
+    return recs
+
+# ---- Оценка коммуникации (5 аспектов, 0-100) ----
+def comm_scores(row):
+    # Простая эвристика
+    contact = 30 + (0 if row["flag_no_contact"] else 30) + (0 if row["flag_no_company"] else 10) + (10 if not row["flag_stuck"] else 0)
+    need = 30 + (20 if not row["flag_no_tasks"] else 0) + (10 if row["OPPORTUNITY"]>0 else 0) + (0 if row["flag_stuck"] else 10)
+    present = 20 + int(row["PROBABILITY"]/2) + (10 if row["potential"]>50 else 0)
+    struct = 30 + (20 if not row["flag_no_tasks"] else 0) + (10 if row["days_no_activity"]<=2 else 0)
+    close = 20 + int(row["PROBABILITY"]) + (10 if row["OPPORTUNITY"]>0 else 0) - (10 if row["flag_stuck"] else 0)
+    s = { 
+        "Открытие контакта": int(np.clip(contact, 0, 100)),
+        "Выявление потребности": int(np.clip(need, 0, 100)),
+        "Презентация и аргументация": int(np.clip(present, 0, 100)),
+        "Ведение диалога": int(np.clip(struct, 0, 100)),
+        "Закрытие и фиксация": int(np.clip(close, 0, 100)),
+    }
+    return s
+
+# ---- Генерация "контента" для карточек отчёта ----
+def report_texts(row):
+    # Фин. готовность
+    if row["OPPORTUNITY"] <= 0:
+        fin = "Бюджет не подтверждён, сумма в сделке = 0."
+    elif row["PROBABILITY"] < 40:
+        fin = "Бюджет обсуждается, вероятность низкая — требуется подтверждение ЛПР и КП."
+    else:
+        fin = "Бюджет ориентировочно подтверждён, требуется финализация условий."
+    # ЛПР
+    lpr = "Контакт есть" if not row["flag_no_contact"] else "ЛПР не указан — подтвердите ФИО и роль."
+    # Потребность
+    need = "Интерес подтверждён на текущем этапе, уточните критерии успеха и сроки." if row["PROBABILITY"]>=30 else "Потребность не зафиксирована — сформулируйте задачу клиента и желаемый результат."
+    # Сроки
+    if row["flag_no_tasks"]:
+        timebox = "Нет задачи на следующий шаг — согласуйте дату контакта."
+    elif row["flag_stuck"]:
+        timebox = "Просрочка по активности — требуется быстрый контакт и обновление этапа."
+    else:
+        timebox = "Сроки контролируются задачами."
+    # Задача карточки
+    main_task = "Назначить встречу/демо и прислать КП" if row["PROBABILITY"]<50 else "Согласовать условия и направить договор/счёт"
+    return fin, lpr, need, timebox, main_task
+
+# ---- Таймлайн активности (игрушечная серия) ----
+def activity_series(row, points=60):
+    start = row["DATE_CREATE"] if pd.notna(row["DATE_CREATE"]) else pd.Timestamp.utcnow() - pd.Timedelta(days=30)
+    end = pd.Timestamp.utcnow()
+    if start > end: start = end - pd.Timedelta(days=1)
+    idx = pd.date_range(start, end, periods=points)
+    y = np.random.default_rng(int(row["ID"])).normal(0.1, 0.02, size=points).clip(0,1)
+    # буст около создания и последней активности
+    near_start = np.argmin(np.abs(idx - start))
+    near_last = np.argmin(np.abs(idx - (row["LAST_ACTIVITY_TIME"] if pd.notna(row["LAST_ACTIVITY_TIME"]) else end)))
+    for i in range(points):
+        y[i] += 0.4 * math.exp(-abs(i-near_start)/6)
+        y[i] += 0.8 * math.exp(-abs(i-near_last)/4)
+    return pd.DataFrame({"ts": idx, "activity": y})
 
 # =========================
 # БОКОВАЯ ПАНЕЛЬ / ФИЛЬТРЫ
 # =========================
 st.sidebar.title("Фильтры")
-company_alias = st.sidebar.text_input("Компания (в шапке отчёта)", "ООО «Фокус»")
+company_alias = st.sidebar.text_input("Компания (в шапке)", "ООО «Фокус»")
 date_from = st.sidebar.date_input("С какой даты", datetime.now().date() - timedelta(days=30))
 date_to   = st.sidebar.date_input("По какую дату", datetime.now().date())
 stuck_days = st.sidebar.slider("Нет активности ≥ (дней)", 2, 21, 5)
@@ -265,8 +325,8 @@ limit = st.sidebar.slider("Лимит сделок (API)", 50, 3000, 600, step=5
 # Офлайн-файл (если нет вебхука)
 uploaded_offline = None
 if not BITRIX24_WEBHOOK:
-    st.sidebar.warning("BITRIX24_WEBHOOK не задан — доступен офлайн-режим (загрузите CSV/XLSX).")
-    uploaded_offline = st.sidebar.file_uploader("Загрузить CSV/XLSX со сделками", type=["csv","xlsx"])
+    st.sidebar.warning("BITRIX24_WEBHOOK не задан — офлайн-режим (загрузите CSV/XLSX).")
+    uploaded_offline = st.sidebar.file_uploader("CSV/XLSX со сделками", type=["csv","xlsx"])
 
 # =========================
 # ЗАГРУЗКА ДАННЫХ
@@ -312,27 +372,32 @@ with st.spinner("Готовлю данные…"):
     # Расчёты
     df_scores = compute_health_scores(df_raw, open_tasks_map, stuck_days=stuck_days)
     df_scores["manager"] = df_scores["ASSIGNED_BY_ID"].map(users_map).fillna("Неизвестно")
-    mgr = split_green_red(df_scores)
+
+# ---------- Глобальный фильтр по менеджерам ----------
+manager_options = sorted(df_scores["manager"].unique())
+selected_managers = st.sidebar.multiselect("Фильтр по менеджерам", manager_options, default=[])
+view_df = df_scores[df_scores["manager"].isin(selected_managers)] if selected_managers else df_scores.copy()
+mgr = split_green_red(view_df)
 
 # =========================
 # ВЕРХ ШАПКИ
 # =========================
-st.title("RUBI-style Контроль отдела продаж")
-st.caption("Автоаудит воронки • Пульс сделок • Зоны менеджеров • Карточки • Экспорт CSV")
+st.title("БУРМАШ Контроль отдела продаж")
+st.caption("Автоаудит • Пульс • Зоны менеджеров • Карточки • Отчёт по сделке • Экспорт CSV")
 
-# Топ-метрики
+# Топ-метрики (по view)
 c1,c2,c3,c4,c5 = st.columns(5, gap="small")
-with c1: st.metric("Всего сделок", int(df_scores.shape[0]))
-with c2: st.metric("Объём, ₽", f"{int(df_scores['OPPORTUNITY'].sum()):,}".replace(","," "))
-with c3: st.metric("Средний чек, ₽", f"{int(df_scores['OPPORTUNITY'].replace(0,np.nan).mean() or 0):,}".replace(","," "))
-with c4: st.metric("Средн. здоровье", f"{df_scores['health'].mean():.0f}%")
-with c5: st.metric("Суммарный потенциал", int(df_scores["potential"].sum()))
+with c1: st.metric("Всего сделок", int(view_df.shape[0]))
+with c2: st.metric("Объём, ₽", f"{int(view_df['OPPORTUNITY'].sum()):,}".replace(","," "))
+with c3: st.metric("Средний чек, ₽", f"{int(view_df['OPPORTUNITY'].replace(0,np.nan).mean() or 0):,}".replace(","," "))
+with c4: st.metric("Средн. здоровье", f"{view_df['health'].mean():.0f}%")
+with c5: st.metric("Суммарный потенциал", int(view_df["potential"].sum()))
 
 # =========================
 # ВКЛАДКИ
 # =========================
-tab_pulse, tab_audit, tab_managers, tab_cards, tab_export = st.tabs([
-    "⛵ Пульс сделок", "🚁 Аудит воронки", "🚀 Менеджеры", "🗂 Карточки", "⬇️ Экспорт (CSV)"
+tab_pulse, tab_audit, tab_managers, tab_cards, tab_deal, tab_export = st.tabs([
+    "⛵ Пульс сделок", "🚁 Аудит воронки", "🚀 Менеджеры", "🗂 Карточки", "📄 Отчёт по сделке", "⬇️ Экспорт (CSV)"
 ])
 
 # --- ПУЛЬС
@@ -343,17 +408,17 @@ with tab_pulse:
         a,b = st.columns([3,2], gap="large")
         with a:
             st.subheader("Динамика по этапам")
-            stage_df = df_scores.groupby("STAGE_ID").agg(Сумма=("OPPORTUNITY","sum"), Количество=("ID","count")).reset_index()
+            stage_df = view_df.groupby("STAGE_ID").agg(Сумма=("OPPORTUNITY","sum"), Количество=("ID","count")).reset_index()
             fig = px.bar(stage_df, x="STAGE_ID", y="Сумма", text="Количество")
             st.plotly_chart(fig, use_container_width=True)
         with b:
             st.subheader("Распределение здоровья")
-            fig2 = px.histogram(df_scores, x="health", nbins=20)
+            fig2 = px.histogram(view_df, x="health", nbins=20)
             st.plotly_chart(fig2, use_container_width=True)
 
     st.subheader("Лента изменений (последние)")
     st.dataframe(
-        df_scores.sort_values("DATE_MODIFY", ascending=False)[
+        view_df.sort_values("DATE_MODIFY", ascending=False)[
             ["ID","TITLE","manager","STAGE_ID","OPPORTUNITY","health","potential","DATE_MODIFY"]
         ].head(200),
         height=360
@@ -361,13 +426,13 @@ with tab_pulse:
 
 # --- АУДИТ
 with tab_audit:
-    st.subheader("Проблемные зоны")
+    st.subheader("Проблемные зоны (по фильтру)")
     kpis = {
-        "Сделок без задач": int((~df_scores["ID"].isin(open_tasks_map.keys())).sum()),
-        "Сделок без контактов": int(df_scores["flag_no_contact"].sum()),
-        "Сделок без компаний": int(df_scores["flag_no_company"].sum()),
-        "Застрявшие сделки": int(df_scores["flag_stuck"].sum()),
-        "Потерянные сделки": int(df_scores["flag_lost"].sum()),
+        "Сделок без задач": int((~view_df["ID"].isin(open_tasks_map.keys())).sum()),
+        "Сделок без контактов": int(view_df["flag_no_contact"].sum()),
+        "Сделок без компаний": int(view_df["flag_no_company"].sum()),
+        "Застрявшие сделки": int(view_df["flag_stuck"].sum()),
+        "Потерянные сделки": int(view_df["flag_lost"].sum()),
     }
     a,b,c,d,e = st.columns(5)
     a.metric("Без задач", kpis["Сделок без задач"])
@@ -379,25 +444,25 @@ with tab_audit:
     st.markdown("##### Списки по категориям")
     cols = st.columns(5, gap="small")
     lists = [
-        ("Без задач", ~df_scores["ID"].isin(open_tasks_map.keys())),
-        ("Без контактов", df_scores["flag_no_contact"]),
-        ("Без компаний", df_scores["flag_no_company"]),
-        ("Застряли", df_scores["flag_stuck"]),
-        ("Потерянные", df_scores["flag_lost"]),
+        ("Без задач", ~view_df["ID"].isin(open_tasks_map.keys())),
+        ("Без контактов", view_df["flag_no_contact"]),
+        ("Без компаний", view_df["flag_no_company"]),
+        ("Застряли", view_df["flag_stuck"]),
+        ("Потерянные", view_df["flag_lost"]),
     ]
     for (title, mask), holder in zip(lists, cols):
         with holder:
             st.markdown(f'<div class="rubi-card"><div class="rubi-title">{title}</div>', unsafe_allow_html=True)
             st.dataframe(
-                df_scores[mask][["ID","TITLE","manager","STAGE_ID","OPPORTUNITY","health","days_no_activity"]].head(80),
+                view_df[mask][["ID","TITLE","manager","STAGE_ID","OPPORTUNITY","health","days_no_activity"]].head(80),
                 height=260
             )
             st.markdown("</div>", unsafe_allow_html=True)
 
 # --- МЕНЕДЖЕРЫ
 with tab_managers:
-    st.subheader("Зелёная / Красная зоны по менеджерам")
-    mgr = mgr.copy()
+    st.subheader("Зелёная / Красная зоны по менеджерам (по фильтру)")
+    mgr = split_green_red(view_df)
     mgr["manager"] = mgr["ASSIGNED_BY_ID"].map(users_map).fillna("Неизвестно")
 
     left, right = st.columns([1.5,1], gap="large")
@@ -422,7 +487,7 @@ with tab_managers:
 
     with right:
         st.markdown("#### Лидеры и рисковые")
-        agg = df_scores.groupby("manager").agg(
+        agg = view_df.groupby("manager").agg(
             deals=("ID","count"),
             health_avg=("health","mean"),
             opp=("OPPORTUNITY","sum"),
@@ -439,18 +504,16 @@ with tab_managers:
 
 # --- КАРТОЧКИ
 with tab_cards:
-    st.subheader("Карточки с оценкой и планом")
-    pick_manager = st.multiselect("Фильтр по менеджерам", sorted(df_scores["manager"].unique()), default=[])
-    pick = df_scores[df_scores["manager"].isin(pick_manager)] if pick_manager else df_scores
-    pick = pick.sort_values(["health","potential","OPPORTUNITY"], ascending=[True,False,False]).head(30)
-
+    st.subheader("Карточки сделок с быстрым планом")
+    pick = view_df.sort_values(["health","potential","OPPORTUNITY"], ascending=[True,False,False]).head(30)
     grid_cols = st.columns(3, gap="medium")
     for i, (_, row) in enumerate(pick.iterrows()):
         with grid_cols[i % 3]:
-            status = "rubi-bad" if row["health"] < 60 else ("rubi-good" if row["health"]>=80 else "")
+            status = "rubi-bad" if row["health"] < 60 else ("rubi-good" if row["health"]>=80 else "rubi-warn")
             risks_list = [k.replace("flag_","").replace("_"," ") for k in [
                 "flag_no_tasks","flag_no_company","flag_no_contact","flag_stuck"
             ] if row[k]]
+            recs = deal_recommendations(row)
             st.markdown(f"""
             <div class="rubi-card">
               <div class="rubi-title">{row['TITLE']}</div>
@@ -464,32 +527,171 @@ with tab_cards:
               <hr/>
               <div class="small">
                 ⚠️ Риски: {", ".join(risks_list) or "нет"}<br/>
-                ❌ Потеряна: {"да" if row["flag_lost"] else "нет"}<br/>
+              </div>
+              <div class="small">
+                ✅ Рекомендации:<br/>• {"<br/>• ".join(recs)}
               </div>
             </div>
             """, unsafe_allow_html=True)
 
+# --- ОТЧЁТ ПО СДЕЛКЕ (как в РУБИ)
+with tab_deal:
+    st.subheader("Отчёт по сделке (стиль РУБИ)")
+    # выбор сделки
+    options = view_df.sort_values("DATE_MODIFY", ascending=False)
+    label_map = {int(r.ID): f"[{int(r.ID)}] {r.TITLE} — {r.manager}" for r in options[["ID","TITLE","manager"]].itertuples(index=False)}
+    chosen_id = st.selectbox("Выберите сделку", list(label_map.keys()), format_func=lambda x: label_map[x])
+    deal = view_df[view_df["ID"]==chosen_id].iloc[0]
+
+    fin, lpr, need, timebox, main_task = report_texts(deal)
+    comm = comm_scores(deal)
+    act = activity_series(deal)
+
+    # шапка
+    a,b,c,d = st.columns([1.2,1,1,1])
+    with a:
+        st.markdown(f"#### {deal['TITLE']}")
+        st.caption(f"Компания: {company_alias} • Ответственный: {deal['manager']}")
+    with b:
+        st.markdown(f"<div class='score-circle'>{deal['potential']}</div><div class='kpi-caption'>Потенциал сделки</div>", unsafe_allow_html=True)
+    with c:
+        st.markdown(f"<div class='score-circle'>{deal['health']}</div><div class='kpi-caption'>Здоровье сделки</div>", unsafe_allow_html=True)
+    with d:
+        st.markdown(f"<div class='kpi-number'>{int(deal['OPPORTUNITY']) if deal['OPPORTUNITY'] else 0}</div><div class='kpi-caption'>Сумма, ₽</div>", unsafe_allow_html=True)
+
+    st.markdown("<br/>", unsafe_allow_html=True)
+    # строки карточек
+    col1, col2 = st.columns(2, gap="large")
+
+    with col1:
+        st.markdown("##### Общая информация")
+        cgrid = st.container()
+        with cgrid:
+            st.markdown(f"""
+            <div class="grid-2">
+              <div class="rubi-card">
+                <div class="rubi-title">Сумма сделки</div>
+                <div class="kpi-number">{int(deal['OPPORTUNITY'])}</div>
+                <div class="kpi-caption">вероятность {int(deal['PROBABILITY'])}%</div>
+              </div>
+              <div class="rubi-card">
+                <div class="rubi-title">Дней в работе</div>
+                <div class="kpi-number">{deal['days_in_work']}</div>
+                <div class="kpi-caption">без активности {deal['days_no_activity']} дн</div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("##### Контекст сделки")
+        st.markdown(f"""
+        <div class="grid-2">
+          <div class="rubi-card"><div class="rubi-title">Финансовая готовность</div><div class="small">{fin}</div></div>
+          <div class="rubi-card"><div class="rubi-title">Полномочие принятия решения</div><div class="small">{lpr}</div></div>
+        </div>
+        <div class="grid-2">
+          <div class="rubi-card"><div class="rubi-title">Потребность и наш фокус</div><div class="small">{need}</div></div>
+          <div class="rubi-card"><div class="rubi-title">Сроки и готовность к покупке</div><div class="small">{timebox}</div></div>
+        </div>
+        <div class="rubi-card"><div class="rubi-title">Задача</div><div class="small">Менеджеру: {main_task}.</div></div>
+        """, unsafe_allow_html=True)
+
+    with col2:
+        st.markdown("##### Индикаторы и динамика")
+        st.markdown(f"""
+        <div class="grid-2">
+          <div class="rubi-card">
+            <div class="rubi-title">Потенциал сделки</div>
+            <div class="score-circle">{deal['potential']}</div>
+          </div>
+          <div class="rubi-card">
+            <div class="rubi-title">Здоровье сделки</div>
+            <div class="score-circle">{deal['health']}</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if px is None:
+            st.info("Plotly недоступен — мини-график отключён.")
+        else:
+            fig = px.line(act, x="ts", y="activity")
+            fig.update_yaxes(visible=False)
+            fig.update_layout(margin=dict(l=8,r=8,t=4,b=4), height=220)
+            st.markdown('<div class="rubi-card"><div class="rubi-title">Динамика работы со сделкой</div>', unsafe_allow_html=True)
+            st.plotly_chart(fig, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # Итоги работы + риски
+        risks_list = [name for name,flag in {
+            "без задач": deal["flag_no_tasks"], "без контактов": deal["flag_no_contact"],
+            "без компании": deal["flag_no_company"], "застряла": deal["flag_stuck"]
+        }.items() if flag]
+        st.markdown(f"""
+        <div class="rubi-card">
+          <div class="rubi-title">Итоги работы</div>
+          <div class="small">
+            Этап: {deal['STAGE_ID'] or '—'}. Последняя активность: {str(deal['LAST_ACTIVITY_TIME'])[:19]}.<br/>
+            Риски: {", ".join(risks_list) if risks_list else "существенных рисков не выявлено"}.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Оценка коммуникации
+    st.markdown("##### Оценка коммуникации и рекомендации")
+    g1, g2 = st.columns([1.2,1], gap="large")
+    with g1:
+        left, right = st.columns(2)
+        items = list(comm.items())
+        for i in range(0, len(items), 2):
+            row_items = items[i:i+2]
+            cols = st.columns(len(row_items))
+            for (name, score), holder in zip(row_items, cols):
+                with holder:
+                    st.markdown(f"""
+                    <div class="rubi-card">
+                      <div class="rubi-title">{name}</div>
+                      <div class="score-circle">{score}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+    with g2:
+        recs = deal_recommendations(deal)
+        st.markdown(f"""
+        <div class="rubi-card">
+          <div class="rubi-title">План действий</div>
+          <div class="small">• {"<br/>• ".join(recs)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # выгрузка рекомендаций в txt
+        txt = f"""Отчёт по сделке: {deal['TITLE']} (ID {deal['ID']}) — {deal['manager']}
+Сумма: {int(deal['OPPORTUNITY'])} ₽, Вероятность: {int(deal['PROBABILITY'])}%
+Потенциал: {deal['potential']} / Здоровье: {deal['health']}
+Риски: {", ".join([r for r in risks_list]) if risks_list else "нет"}
+
+План действий:
+- """ + "\n- ".join(recs)
+        st.download_button("Скачать рекомендации (.txt)", data=txt.encode("utf-8"), file_name=f"deal_{int(deal['ID'])}_plan.txt")
+
 # --- ЭКСПОРТ (CSV в ZIP)
 with tab_export:
-    st.subheader("Экспорт CSV (ZIP) — работает без Excel")
+    st.subheader("Экспорт CSV (ZIP) — без Excel")
 
     # 01 — Сводка
     summary_df = pd.DataFrame({
         "Метрика": ["Всего сделок","Объём","Средн. здоровье","Застряли","Без задач","Без контактов","Без компаний","Потерянные"],
         "Значение": [
-            df_scores.shape[0],
-            int(df_scores["OPPORTUNITY"].sum()),
-            f"{df_scores['health'].mean():.0f}%",
-            int(df_scores["flag_stuck"].sum()),
-            int((~df_scores['ID'].isin(open_tasks_map.keys())).sum()),
-            int(df_scores["flag_no_contact"].sum()),
-            int(df_scores["flag_no_company"].sum()),
-            int(df_scores["flag_lost"].sum()),
+            view_df.shape[0],
+            int(view_df["OPPORTUNITY"].sum()),
+            f"{view_df['health'].mean():.0f}%",
+            int(view_df["flag_stuck"].sum()),
+            int((~view_df['ID'].isin(open_tasks_map.keys())).sum()),
+            int(view_df["flag_no_contact"].sum()),
+            int(view_df["flag_no_company"].sum()),
+            int(view_df["flag_lost"].sum()),
         ]
     })
 
     # 02 — Менеджеры
-    mgr_out = split_green_red(df_scores)
+    mgr_out = split_green_red(view_df)
     mgr_out["manager"] = mgr_out["ASSIGNED_BY_ID"].map(users_map).fillna("Неизвестно")
     mgr_out = mgr_out[["manager","deals","opp_sum","health_avg","no_tasks","stuck","lost","zone"]]
 
@@ -497,7 +699,7 @@ with tab_export:
     deal_cols = ["ID","TITLE","manager","STAGE_ID","OPPORTUNITY","PROBABILITY","health","potential",
                  "days_in_work","days_no_activity","flag_no_tasks","flag_no_contact","flag_no_company",
                  "flag_stuck","flag_lost","DATE_CREATE","DATE_MODIFY","LAST_ACTIVITY_TIME"]
-    deals_out = df_scores[deal_cols].copy()
+    deals_out = view_df[deal_cols].copy()
 
     def pack_zip_csv():
         mem = BytesIO()
@@ -517,21 +719,6 @@ with tab_export:
     )
 
 # =========================
-# AI-КРАТКОЕ РЕЗЮМЕ
-# =========================
-st.markdown("### 🔮 AI-резюме и план действий")
-if st.button("Сформировать краткий обзор"):
-    with st.spinner("Формирую AI-обзор…"):
-        text, actions = ai_summarize(company_alias, df_scores, mgr, PERPLEXITY_API_KEY, PERPLEXITY_API_URL)
-    st.info(text or "—")
-    if actions:
-        st.markdown("**Шаги:**")
-        for a in actions:
-            st.write(f"• {a}")
-    else:
-        st.caption("Нет рекомендаций / ИИ недоступен.")
-
-# =========================
 # ПОДВАЛ
 # =========================
-st.caption("RUBI-like Dashboard • автоаудит, пульс, менеджерские зоны, карточки, экспорт CSV. v1.2 (no-Excel)")
+st.caption("RUBI-like Dashboard • автоаудит, пульс, менеджерские зоны, карточки, РУБИ-отчёт по сделке, экспорт CSV. v2.0")

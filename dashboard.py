@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-RUBI-like CRM Dashboard (Streamlit)
+RUBI-like CRM Dashboard (Streamlit, no-Excel build)
 - Пульс воронки, аудит, карточки сделок, зелёная/красная зоны по менеджерам
-- Экспорт в XLSX (XlsxWriter или openpyxl — с фолбэком)
 - Источник данных: Bitrix24 (webhook) или офлайн-таблица (CSV/XLSX)
+- Экспорт: ZIP с CSV-файлами (без Excel-зависимостей)
 """
 
 import os
@@ -11,12 +11,14 @@ import json
 import time
 import hashlib
 from datetime import datetime, timedelta
+from io import BytesIO
+import zipfile
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Пакеты для графиков
+# Графики (опционально, если plotly нет — UI работает без них)
 try:
     import plotly.express as px
 except Exception:
@@ -46,7 +48,7 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # =========================
 # ПРОСТАЯ АВТОРИЗАЦИЯ
 # логин: admin
-# пароль-хэш: 123 (можно заменить — см. ниже)
+# пароль: 123  (можешь заменить хэш ниже)
 # =========================
 def check_password():
     def password_entered():
@@ -76,13 +78,12 @@ with st.sidebar:
 # СЕКРЕТЫ / ПЕРЕМЕННЫЕ
 # =========================
 def get_secret(name, default=None):
-    # сначала из st.secrets, затем из переменных окружения
     if name in st.secrets:
         return st.secrets[name]
     return os.getenv(name, default)
 
-BITRIX24_WEBHOOK = get_secret("BITRIX24_WEBHOOK", "").strip()
-PERPLEXITY_API_KEY = get_secret("PERPLEXITY_API_KEY", "").strip()
+BITRIX24_WEBHOOK = (get_secret("BITRIX24_WEBHOOK", "") or "").strip()
+PERPLEXITY_API_KEY = (get_secret("PERPLEXITY_API_KEY", "") or "").strip()
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
 
 # =========================
@@ -291,9 +292,7 @@ with st.spinner("Готовлю данные…"):
         else:
             df_raw = pd.read_excel(uploaded_offline)
 
-        # Приводим названия столбцов к ожидаемым
         df_raw.columns = [c.strip() for c in df_raw.columns]
-        # Минимально обязательные
         must = ["ID","TITLE","STAGE_ID","OPPORTUNITY","ASSIGNED_BY_ID",
                 "COMPANY_ID","CONTACT_ID","PROBABILITY","DATE_CREATE","DATE_MODIFY","LAST_ACTIVITY_TIME"]
         missing = [c for c in must if c not in df_raw.columns]
@@ -301,7 +300,6 @@ with st.spinner("Готовлю данные…"):
             st.error(f"Не хватает колонок: {missing}")
             st.stop()
         df_raw["OPPORTUNITY"] = pd.to_numeric(df_raw["OPPORTUNITY"], errors="coerce").fillna(0.0)
-        # В офлайн-режиме имена пользователей можно передать колонкой manager или будут ID
         users_map = {int(i): str(i) for i in pd.to_numeric(df_raw["ASSIGNED_BY_ID"], errors="coerce").fillna(0).astype(int).unique()}
         if "manager" in df_raw.columns:
             for aid, name in df_raw[["ASSIGNED_BY_ID","manager"]].dropna().values:
@@ -309,7 +307,7 @@ with st.spinner("Готовлю данные…"):
                     users_map[int(aid)] = str(name)
                 except Exception:
                     pass
-        open_tasks_map = {}  # нет доступа к activity — считаем, что задач нет (можно добавить колонку и учесть)
+        open_tasks_map = {}  # в офлайне считаем, что задач нет (или добавь колонку для явного признака)
 
     # Расчёты
     df_scores = compute_health_scores(df_raw, open_tasks_map, stuck_days=stuck_days)
@@ -320,7 +318,7 @@ with st.spinner("Готовлю данные…"):
 # ВЕРХ ШАПКИ
 # =========================
 st.title("RUBI-style Контроль отдела продаж")
-st.caption("Автоаудит воронки • Пульс сделок • Зоны менеджеров • Карточки • Экспорт XLSX")
+st.caption("Автоаудит воронки • Пульс сделок • Зоны менеджеров • Карточки • Экспорт CSV")
 
 # Топ-метрики
 c1,c2,c3,c4,c5 = st.columns(5, gap="small")
@@ -334,7 +332,7 @@ with c5: st.metric("Суммарный потенциал", int(df_scores["poten
 # ВКЛАДКИ
 # =========================
 tab_pulse, tab_audit, tab_managers, tab_cards, tab_export = st.tabs([
-    "⛵ Пульс сделок", "🚁 Аудит воронки", "🚀 Менеджеры", "🗂 Карточки", "⬇️ Экспорт"
+    "⛵ Пульс сделок", "🚁 Аудит воронки", "🚀 Менеджеры", "🗂 Карточки", "⬇️ Экспорт (CSV)"
 ])
 
 # --- ПУЛЬС
@@ -471,59 +469,51 @@ with tab_cards:
             </div>
             """, unsafe_allow_html=True)
 
-# --- ЭКСПОРТ
+# --- ЭКСПОРТ (CSV в ZIP)
 with tab_export:
-    st.subheader("Экспорт XLSX (RUBI-style)")
+    st.subheader("Экспорт CSV (ZIP) — работает без Excel")
 
-    def build_excel_bytes():
-        from io import BytesIO
-        bio = BytesIO()
+    # 01 — Сводка
+    summary_df = pd.DataFrame({
+        "Метрика": ["Всего сделок","Объём","Средн. здоровье","Застряли","Без задач","Без контактов","Без компаний","Потерянные"],
+        "Значение": [
+            df_scores.shape[0],
+            int(df_scores["OPPORTUNITY"].sum()),
+            f"{df_scores['health'].mean():.0f}%",
+            int(df_scores["flag_stuck"].sum()),
+            int((~df_scores['ID'].isin(open_tasks_map.keys())).sum()),
+            int(df_scores["flag_no_contact"].sum()),
+            int(df_scores["flag_no_company"].sum()),
+            int(df_scores["flag_lost"].sum()),
+        ]
+    })
 
-        # Подбираем движок: XlsxWriter, иначе openpyxl
-        try:
-            import xlsxwriter  # noqa: F401
-            engine = "xlsxwriter"
-        except ModuleNotFoundError:
-            engine = "openpyxl"
+    # 02 — Менеджеры
+    mgr_out = split_green_red(df_scores)
+    mgr_out["manager"] = mgr_out["ASSIGNED_BY_ID"].map(users_map).fillna("Неизвестно")
+    mgr_out = mgr_out[["manager","deals","opp_sum","health_avg","no_tasks","stuck","lost","zone"]]
 
-        with pd.ExcelWriter(bio, engine=engine) as xw:
-            # 01 — Сводка
-            summary = pd.DataFrame({
-                "Метрика": ["Всего сделок","Объём","Средн. здоровье","Застряли","Без задач","Без контактов","Без компаний","Потерянные"],
-                "Значение": [
-                    df_scores.shape[0],
-                    int(df_scores["OPPORTUNITY"].sum()),
-                    f"{df_scores['health'].mean():.0f}%",
-                    int(df_scores["flag_stuck"].sum()),
-                    int((~df_scores['ID'].isin(open_tasks_map.keys())).sum()),
-                    int(df_scores["flag_no_contact"].sum()),
-                    int(df_scores["flag_no_company"].sum()),
-                    int(df_scores["flag_lost"].sum()),
-                ]
-            })
-            summary.to_excel(xw, sheet_name="01_Сводка", index=False)
+    # 03 — Сделки
+    deal_cols = ["ID","TITLE","manager","STAGE_ID","OPPORTUNITY","PROBABILITY","health","potential",
+                 "days_in_work","days_no_activity","flag_no_tasks","flag_no_contact","flag_no_company",
+                 "flag_stuck","flag_lost","DATE_CREATE","DATE_MODIFY","LAST_ACTIVITY_TIME"]
+    deals_out = df_scores[deal_cols].copy()
 
-            # 02 — Менеджеры
-            mgr_out = split_green_red(df_scores)
-            mgr_out["manager"] = mgr_out["ASSIGNED_BY_ID"].map(users_map).fillna("Неизвестно")
-            mgr_out = mgr_out[["manager","deals","opp_sum","health_avg","no_tasks","stuck","lost","zone"]]
-            mgr_out.to_excel(xw, sheet_name="02_Менеджеры", index=False)
+    def pack_zip_csv():
+        mem = BytesIO()
+        with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("01_summary.csv", summary_df.to_csv(index=False, encoding="utf-8-sig"))
+            zf.writestr("02_managers.csv", mgr_out.to_csv(index=False, encoding="utf-8-sig"))
+            zf.writestr("03_deals.csv", deals_out.to_csv(index=False, encoding="utf-8-sig"))
+        mem.seek(0)
+        return mem.getvalue()
 
-            # 03 — Сделки
-            detail_cols = ["ID","TITLE","manager","STAGE_ID","OPPORTUNITY","PROBABILITY","health","potential",
-                           "days_in_work","days_no_activity","flag_no_tasks","flag_no_contact","flag_no_company",
-                           "flag_stuck","flag_lost","DATE_CREATE","DATE_MODIFY","LAST_ACTIVITY_TIME"]
-            df_scores[detail_cols].to_excel(xw, sheet_name="03_Сделки", index=False)
-
-        bio.seek(0)
-        return bio.getvalue()
-
-    xls_bytes = build_excel_bytes()
+    zip_bytes = pack_zip_csv()
     st.download_button(
-        "Скачать отчёт XLSX",
-        data=xls_bytes,
-        file_name="rubi_like_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "Скачать отчёт (CSV.zip)",
+        data=zip_bytes,
+        file_name="rubi_like_report_csv.zip",
+        mime="application/zip"
     )
 
 # =========================
@@ -544,4 +534,4 @@ if st.button("Сформировать краткий обзор"):
 # =========================
 # ПОДВАЛ
 # =========================
-st.caption("RUBI-like Dashboard • автоаудит, пульс, менеджерские зоны, карточки, экспорт. v1.1")
+st.caption("RUBI-like Dashboard • автоаудит, пульс, менеджерские зоны, карточки, экспорт CSV. v1.2 (no-Excel)")

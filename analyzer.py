@@ -2,9 +2,7 @@ import os
 import requests
 import json
 import time
-from dotenv import load_dotenv
 
-load_dotenv()
 BITRIX24_WEBHOOK = os.getenv('BITRIX24_WEBHOOK')
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
 PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
@@ -12,7 +10,7 @@ PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
 class SimpleAnalyzer:
     def __init__(self):
         if not BITRIX24_WEBHOOK or not PERPLEXITY_API_KEY:
-            raise ValueError("Проверьте .env — нужны BITRIX24_WEBHOOK и PERPLEXITY_API_KEY")
+            raise ValueError("Проверьте Secrets на Streamlit — нужны BITRIX24_WEBHOOK и PERPLEXITY_API_KEY")
         self.webhook = BITRIX24_WEBHOOK.rstrip("/")
         self.headers = {
             "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
@@ -80,33 +78,4 @@ class SimpleAnalyzer:
 
 Ответ строго в формате JSON:
 {{
-  "health_score": 88,
-  "summary": "Краткая аналитика...",
-  "recommendations": ["Совет1", "Совет2", "Совет3"]
-}}
-        """
-        data = {
-            "model": "sonar-pro",
-            "messages": [
-                {"role": "system", "content": "Верни ответ строго JSON, без пояснений."},
-                {"role": "user", "content": prompt}
-            ],
-            "max_tokens": 1200,
-            "temperature": 0.15
-        }
-        resp = requests.post(PERPLEXITY_API_URL, headers=self.headers, json=data)
-        resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"]
-        start, end = text.find('{'), text.rfind('}')+1
-        return json.loads(text[start:end]) if start != -1 and end > start else {
-            "health_score": 40,
-            "summary": "Ошибка разбора JSON",
-            "recommendations": ["Повторить позже"]
-        }
-
-if __name__ == "__main__":
-    an = SimpleAnalyzer()
-    if an.test_connections():
-        deals = an.get_deals(date_from="2025-01-01", limit=50, pause_sec=1.0)
-        print("Найдено сделок:", len(deals))
-        print(an.run_ai_analysis(deals))
+  "health_score": 88

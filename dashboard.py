@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-БУРМАШ · CRM Дэшборд (v5.2)
-— Обновлено под новый вебхук Bitrix24:
-   * Воронки/стадии через crm.dealcategory.list и crm.dealcategory.stage.list
-   * Безопасные фолбэки на crm.status.list
-   * (Опционально) История стадий через crm.stagehistory.deal.list / crm.stagehistory.list, если доступно
-— Всё остальное: как в v5.1 (фильтры периода, агрегация оси, отделы, динамика, воронки, проблемы, менеджеры, план/факт, AI)
+БУРМАШ · CRM Дэшборд (v5.4)
+— Сохранение выбранных фильтров в st.session_state (переживают перезапуски/перерендеры в рамках сессии).
+— Кнопка «Сбросить фильтры».
+— Фильтр «Диапазон дат (с–по)».
+— Фикс графика «По менеджерам → Конверсия по этапам».
+— Источники: Bitrix24 (dealcategory.*, status.list, activity.list, user.get, department.get).
+— Без выгрузок/файлов. Авторизация: admin / admin123.
 """
 
 import os, time, math, calendar
@@ -81,7 +82,6 @@ PERPLEXITY_API_KEY = (get_secret("PERPLEXITY_API_KEY", "") or "").strip()
 
 # ============ Bitrix helpers ============
 def _bx_call(method, params=None, timeout=30):
-    """Единичный вызов, отдаёт dict с 'result' или бросает исключение."""
     url = BITRIX24_WEBHOOK.rstrip("/") + f"/{method}.json"
     r = requests.get(url, params=(params or {}), timeout=timeout)
     r.raise_for_status()
@@ -91,25 +91,16 @@ def _bx_call(method, params=None, timeout=30):
     return data
 
 def _bx_get(method, params=None, pause=0.35):
-    """Пагинация для list-методов. Возвращает объединённый список элементов."""
     out, start = [], 0
     params = dict(params or {})
     while True:
         params["start"] = start
         data = _bx_call(method, params=params)
         res = data.get("result")
-        # некоторые методы возвращают {'items': [...]} внутри result
-        if isinstance(res, dict) and "items" in res:
-            batch = res.get("items") or []
-        else:
-            batch = res or []
-        if not batch:
-            break
+        batch = (res.get("items", []) if isinstance(res, dict) and "items" in res else res) or []
+        if not batch: break
         out.extend(batch)
-        # если вернулось меньше 50 — следующей страницы нет (для большинства list)
-        if len(batch) < 50 and "next" not in data:
-            break
-        # общий фолбэк пагинации
+        if len(batch) < 50 and "next" not in data: break
         start = data.get("next", start + 50)
         time.sleep(pause)
     return out
@@ -128,7 +119,6 @@ def bx_get_deals(date_from=None, date_to=None, limit=3000):
 
 @st.cache_data(ttl=600)
 def bx_get_categories():
-    """Имена воронок. Основной вариант — crm.dealcategory.list; фолбэк — crm.category.list."""
     try:
         cats = _bx_get("crm.dealcategory.list")
         return {int(c["ID"]): c.get("NAME","Воронка") for c in cats}
@@ -141,10 +131,6 @@ def bx_get_categories():
 
 @st.cache_data(ttl=600)
 def bx_get_stage_map_by_category(category_ids):
-    """
-    Карта стадий через crm.dealcategory.stage.list:
-    Возвращает (sort_map, name_map), где ключ — STATUS_ID (например 'C1:WON' или 'C2:NEW').
-    """
     sort_map, name_map = {}, {}
     if not category_ids:
         return sort_map, name_map
@@ -152,18 +138,17 @@ def bx_get_stage_map_by_category(category_ids):
         try:
             stages = _bx_get("crm.dealcategory.stage.list", {"id": cid})
             for s in stages:
-                sid = s.get("STATUS_ID") or s.get("ID")  # STATUS_ID — основной
+                sid = s.get("STATUS_ID") or s.get("ID")
                 if not sid: continue
                 sort_map[sid] = int(s.get("SORT", 5000))
                 name_map[sid] = s.get("NAME") or sid
         except Exception:
             continue
-    # фолбэк: crm.status.list (глобальные стадии)
     if not name_map:
         try:
             base = _bx_get("crm.status.list", {"filter[ENTITY_ID]":"DEAL_STAGE"})
             for s in base:
-                sid = s.get("STATUS_ID"); 
+                sid = s.get("STATUS_ID")
                 if not sid: continue
                 sort_map[sid] = int(s.get("SORT", 5000))
                 name_map[sid] = s.get("NAME") or sid
@@ -184,7 +169,7 @@ def bx_get_users_full():
     out = {}
     for u in users:
         depts = u.get("UF_DEPARTMENT") or []
-        if isinstance(depts, str): 
+        if isinstance(depts, str):
             depts = [int(x) for x in depts.split(",") if x]
         out[int(u["ID"])] = {
             "name": ((u.get("NAME","")+" "+u.get("LAST_NAME","")).strip() or u.get("LOGIN","")).strip(),
@@ -214,15 +199,9 @@ def bx_get_activities(deal_ids, include_completed=True):
 
 @st.cache_data(ttl=300)
 def bx_get_stage_history_lite(deal_ids, max_deals=300):
-    """
-    Опциональная история стадий, безопасно.
-    Пытаемся: 1) crm.stagehistory.deal.list (по стандарту), 2) crm.stagehistory.list (по PORTAL).
-    Возвращает dict: {deal_id: [ {STAGE_ID, CREATED_TIME, ...}, ... ] }
-    """
     if not deal_ids: return {}
     hist = {}
-    ids = list(map(int, deal_ids))[:max_deals]  # ограничение по производительности
-    # Попытка №1: crm.stagehistory.deal.list (обычно требует OWNER_ID по одному)
+    ids = list(map(int, deal_ids))[:max_deals]
     try:
         for did in ids:
             items = _bx_get("crm.stagehistory.deal.list", {"filter[OWNER_ID]": did})
@@ -230,7 +209,6 @@ def bx_get_stage_history_lite(deal_ids, max_deals=300):
                 hist[did] = items
     except Exception:
         pass
-    # Попытка №2: crm.stagehistory.list (универсальный вариант)
     try:
         remain = [i for i in ids if i not in hist]
         for did in remain:
@@ -267,7 +245,7 @@ def to_dt(x):
     except:
         return pd.NaT
 
-def period_range(mode, start_date=None, year=None, quarter=None, month=None, iso_week=None):
+def period_range(mode, start_date=None, end_date=None, year=None, quarter=None, month=None, iso_week=None):
     today = date.today()
     if mode == "НИТ":
         start = start_date or (today - timedelta(days=30)); end = today
@@ -282,6 +260,11 @@ def period_range(mode, start_date=None, year=None, quarter=None, month=None, iso
     elif mode == "Неделя":
         y = int(year or today.isocalendar().year); w = int(iso_week or today.isocalendar().week)
         start = pd.to_datetime(f"{y}-W{w}-1").date(); end = start + timedelta(days=6)
+    elif mode == "Диапазон дат":
+        s = start_date or (today - timedelta(days=30))
+        e = end_date or today
+        if e < s: s, e = e, s
+        start, end = s, e
     else:
         start = today - timedelta(days=30); end = today
     return start, end
@@ -293,11 +276,9 @@ def previous_period(start, end):
     return prev_start, prev_end
 
 def period_freq(mode):
-    if mode == "НИТ": return "D"
+    if mode in ("НИТ","Месяц","Неделя","Диапазон дат"): return "D"
     if mode == "Год": return "M"
     if mode == "Квартал": return "W-MON"
-    if mode == "Месяц": return "D"
-    if mode == "Неделя": return "D"
     return "D"
 
 def freq_from_label(label):
@@ -378,10 +359,6 @@ def compute_health_scores(df, open_tasks_map, stuck_days=5):
     return pd.DataFrame(rows)
 
 def normalize_name(x): return str(x or "").strip().casefold()
-def is_success(row, category_name, stage_name):
-    cat = normalize_name(category_name)
-    target = SUCCESS_NAME_BY_CAT.get(cat)
-    return bool(target and (str(stage_name or "") == target))
 def is_failure_reason(stage_name):
     name = str(stage_name or "")
     return (name in FAIL_GROUP1) or (name in FAIL_GROUP2)
@@ -392,63 +369,123 @@ def failure_group(stage_name):
     return "Прочее"
 
 def cheat_flags_for_deal(acts):
+    """Простая и надёжная эвристика «обходов»."""
     if not acts: return {"reschedules":0, "micro_tasks":0}
     df = pd.DataFrame(acts)
     for col in ["CREATED","LAST_UPDATED","DEADLINE","START_TIME","END_TIME"]:
         if col in df: df[col] = pd.to_datetime(df[col], errors="coerce")
+    # переносы дедлайнов по одному SUBJECT
     reschedules = 0
     if "SUBJECT" in df.columns and "DEADLINE" in df.columns:
         for _, g in df.groupby("SUBJECT"):
             uniq = g["DEADLINE"].dropna().dt.floor("D").nunique()
             if uniq > 1: reschedules += (uniq - 1)
+    # микро-задачи <=15 минут
     micro = 0
     if "START_TIME" in df.columns and "END_TIME" in df.columns:
         dur = (df["END_TIME"] - df["START_TIME"]).dt.total_seconds() / 60.0
         micro += int((dur.dropna() <= 15).sum())
     return {"reschedules":int(reschedules), "micro_tasks":int(micro)}
 
-# ============ Сайдбар: период/агрегация/история ============
+# ============ Фильтры с сохранением состояния ============
+def ss_get(k, default):
+    if k not in st.session_state: st.session_state[k] = default
+    return st.session_state[k]
+
 st.sidebar.title("Фильтры периода")
-mode = st.sidebar.selectbox("Режим периода", ["НИТ","Год","Квартал","Месяц","Неделя"], index=0)
+
+mode_options = ["НИТ","Год","Квартал","Месяц","Неделя","Диапазон дат"]
+default_mode = ss_get("flt_mode", "НИТ")
+mode = st.sidebar.selectbox("Режим периода", mode_options,
+                            index=mode_options.index(default_mode), key="flt_mode")
+
+# Значения по умолчанию для различных режимов
+ss_get("flt_nit_from", datetime.now().date()-timedelta(days=30))
+ss_get("flt_year", datetime.now().year)
+ss_get("flt_quarter", (datetime.now().month-1)//3 + 1)
+ss_get("flt_month", datetime.now().month)
+ss_get("flt_week_year", datetime.now().isocalendar().year)
+ss_get("flt_week_num", datetime.now().isocalendar().week)
+ss_get("flt_range_from", datetime.now().date()-timedelta(days=30))
+ss_get("flt_range_to", datetime.now().date())
+
 if mode == "НИТ":
-    start_input = st.sidebar.date_input("НИТ — с какой даты", datetime.now().date()-timedelta(days=30))
-    year=quarter=month=iso_week=None
+    st.sidebar.date_input("НИТ — с какой даты", key="flt_nit_from")
 elif mode == "Год":
-    year = st.sidebar.number_input("Год", min_value=2020, max_value=2100, value=datetime.now().year, step=1)
-    start_input=month=quarter=iso_week=None
+    st.sidebar.number_input("Год", min_value=2020, max_value=2100, step=1, key="flt_year")
 elif mode == "Квартал":
-    year = st.sidebar.number_input("Год", min_value=2020, max_value=2100, value=datetime.now().year, step=1)
-    quarter = st.sidebar.selectbox("Квартал", [1,2,3,4], index=(datetime.now().month-1)//3)
-    start_input=month=iso_week=None
+    st.sidebar.number_input("Год", min_value=2020, max_value=2100, step=1, key="flt_year")
+    st.sidebar.selectbox("Квартал", [1,2,3,4], index=st.session_state["flt_quarter"]-1, key="flt_quarter")
 elif mode == "Месяц":
-    year = st.sidebar.number_input("Год", min_value=2020, max_value=2100, value=datetime.now().year, step=1)
-    month = st.sidebar.selectbox("Месяц", list(range(1,13)), index=datetime.now().month-1)
-    start_input=quarter=iso_week=None
-else:
-    year = st.sidebar.number_input("Год", min_value=2020, max_value=2100, value=datetime.now().isocalendar().year, step=1)
-    iso_week = st.sidebar.number_input("ISO-неделя", min_value=1, max_value=53, value=datetime.now().isocalendar().week, step=1)
-    start_input=quarter=month=None
+    st.sidebar.number_input("Год", min_value=2020, max_value=2100, step=1, key="flt_year")
+    st.sidebar.selectbox("Месяц", list(range(1,13)), index=st.session_state["flt_month"]-1, key="flt_month")
+elif mode == "Неделя":
+    st.sidebar.number_input("Год", min_value=2020, max_value=2100, step=1, key="flt_week_year")
+    st.sidebar.number_input("ISO-неделя", min_value=1, max_value=53, step=1, key="flt_week_num")
+elif mode == "Диапазон дат":
+    st.sidebar.date_input("С даты", key="flt_range_from")
+    st.sidebar.date_input("По дату", key="flt_range_to")
 
 st.sidebar.title("Агрегация графиков")
-agg_label = st.sidebar.selectbox("Ось времени (агрегация)", ["Авто (от режима)","Дни","Недели","Месяцы"], index=0)
-agg_freq = freq_from_label(agg_label)
+agg_default = ss_get("flt_agg_label", "Авто (от режима)")
+st.sidebar.selectbox("Ось времени (агрегация)", ["Авто (от режима)","Дни","Недели","Месяцы"],
+                     index=["Авто (от режима)","Дни","Недели","Месяцы"].index(agg_default),
+                     key="flt_agg_label")
+agg_freq = freq_from_label(st.session_state["flt_agg_label"])
 
-stuck_days = st.sidebar.slider("Нет активности ≥ (дней)", 2, 21, 5)
-limit      = st.sidebar.slider("Лимит сделок (API)", 50, 3000, 1000, step=50)
+st.sidebar.slider("Нет активности ≥ (дней)", 2, 21, 5, key="flt_stuck_days")
+st.sidebar.slider("Лимит сделок (API)", 50, 3000, 1000, step=50, key="flt_limit")
 
 st.sidebar.title("История стадий (опционально)")
-use_history = st.sidebar.checkbox("Использовать историю стадий (если доступна)", value=True)
-history_limit = st.sidebar.slider("Макс. сделок для истории", 50, 800, 300, step=50)
+st.sidebar.checkbox("Использовать историю стадий (если доступна)", value=True, key="flt_use_history")
+st.sidebar.slider("Макс. сделок для истории", 50, 800, 300, step=50, key="flt_history_limit")
+
+# Кнопка сброса фильтров
+def reset_filters():
+    for k in list(st.session_state.keys()):
+        if k.startswith("flt_"):
+            del st.session_state[k]
+    st.rerun()
+
+st.sidebar.button("↺ Сбросить фильтры", on_click=reset_filters, key="flt_reset_btn")
+
+# Считываем значения для расчётов
+mode = st.session_state["flt_mode"]
+agg_label = st.session_state["flt_agg_label"]
+stuck_days = st.session_state["flt_stuck_days"]
+limit = st.session_state["flt_limit"]
+use_history = st.session_state["flt_use_history"]
+history_limit = st.session_state["flt_history_limit"]
+
+# Преобразуем в period_range
+if mode == "НИТ":
+    start_input = st.session_state["flt_nit_from"]; end_input=None
+    year=quarter=month=iso_week=None
+elif mode == "Год":
+    year = int(st.session_state["flt_year"]); quarter=month=iso_week=None
+    start_input=end_input=None
+elif mode == "Квартал":
+    year = int(st.session_state["flt_year"]); quarter = int(st.session_state["flt_quarter"])
+    month=iso_week=None; start_input=end_input=None
+elif mode == "Месяц":
+    year = int(st.session_state["flt_year"]); month = int(st.session_state["flt_month"])
+    quarter=iso_week=None; start_input=end_input=None
+elif mode == "Неделя":
+    year = int(st.session_state["flt_week_year"]); iso_week = int(st.session_state["flt_week_num"])
+    quarter=month=None; start_input=end_input=None
+else:  # Диапазон дат
+    start_input = st.session_state["flt_range_from"]; end_input = st.session_state["flt_range_to"]
+    year=quarter=month=iso_week=None
 
 # ============ Загрузка данных ============
 with st.spinner("Загружаю данные…"):
     if not BITRIX24_WEBHOOK:
         st.error("Не указан BITRIX24_WEBHOOK в Secrets."); st.stop()
-    start, end = period_range(mode, start_date=start_input, year=year, quarter=quarter, month=month, iso_week=iso_week)
+    start, end = period_range(mode, start_date=start_input, end_date=end_input, year=year, quarter=quarter, month=month, iso_week=iso_week)
 
     deals_raw = bx_get_deals(str(start), str(end), limit=limit)
     if not deals_raw:
-        st.error("Сделок не найдено за период."); st.stop()
+        st.error("Сделок не найдено за выбранный период."); st.stop()
     df_raw = pd.DataFrame(deals_raw)
     df_raw["OPPORTUNITY"] = pd.to_numeric(df_raw.get("OPPORTUNITY"), errors="coerce").fillna(0.0)
 
@@ -460,8 +497,7 @@ with st.spinner("Загружаю данные…"):
 # Основная таблица
 df = compute_health_scores(df_raw, {k:v for k,v in activities.items() if v}, stuck_days=stuck_days)
 
-# Карта стадий (через dealcategory.stage.list)
-stage_ids = df["STAGE_ID"].dropna().astype(str).unique().tolist()
+# Карта стадий
 cat_ids   = df["CATEGORY_ID"].dropna().astype(int).unique().tolist()
 sort_map, name_map = bx_get_stage_map_by_category(cat_ids)
 
@@ -476,48 +512,42 @@ df["manager"]    = df["ASSIGNED_BY_ID"].map(users_map).fillna("Неизвест�
 df["category"]   = df["CATEGORY_ID"].map(lambda x: categories.get(int(x or 0), "Воронка"))
 df["cat_norm"]   = df["category"].map(lambda x: str(x or "").strip().casefold())
 
-# Флаги успех/провал по названиям
+# Флаги успех/провал
 df["is_success"] = df.apply(lambda r: (SUCCESS_NAME_BY_CAT.get(r["cat_norm"]) == r["stage_name"]), axis=1)
 df["is_fail"]    = df["stage_name"].map(is_failure_reason)
 df["fail_group"] = df["stage_name"].map(failure_group)
 
 # Обходы
-df["reschedules"] = df["ID"].map(lambda i: cheat_flags_for_deal(activities.get(int(i)))["reschedules"])
-df["micro_tasks"] = df["ID"].map(lambda i: cheat_flags_for_deal(activities.get(int(i)))["micro_tasks"])
+df["reschedules"] = df["ID"].map(lambda i: cheat_flags_for_deal(activities.get(int(i))).get("reschedules",0))
+df["micro_tasks"] = df["ID"].map(lambda i: cheat_flags_for_deal(activities.get(int(i))).get("micro_tasks",0))
 df["cheat_flag"]  = (df["reschedules"]>=3) | (df["micro_tasks"]>=5)
 
-# (Опционально) История стадий: атрибутируем провал по фактическому этапу из истории, если доступно
+# (Опционально) История стадий
 history_info = {}
 if use_history:
     try:
         history_raw = bx_get_stage_history_lite(df["ID"].tolist(), max_deals=history_limit)
-        # Преобразуем историю: для каждого DEAL_ID сортируем по времени, находим последнюю запись перед «провалом»
         for did, items in history_raw.items():
             h = pd.DataFrame(items)
             if h.empty: 
                 continue
-            # ожидаемые поля: STAGE_ID (или STATUS_ID), CREATED_TIME/CREATED
             if "STAGE_ID" not in h.columns and "STATUS_ID" in h.columns:
                 h["STAGE_ID"] = h["STATUS_ID"]
+            time_cols = []
             for c in ["CREATED_TIME","CREATED","CHANGED_TIME","DATE_CREATE"]:
                 if c in h.columns:
-                    h[c] = pd.to_datetime(h[c], errors="coerce")
-            # попытаемся взять хронологию
-            time_cols = [c for c in ["CREATED_TIME","CREATED","CHANGED_TIME","DATE_CREATE"] if c in h.columns]
+                    h[c] = pd.to_datetime(h[c], errors="coerce"); time_cols.append(c)
             if not time_cols:
                 continue
             tcol = time_cols[0]
             h = h.dropna(subset=[tcol]).sort_values(tcol)
             history_info[did] = h[["STAGE_ID", tcol]].rename(columns={tcol:"TS"})
     except Exception:
-        pass
+        history_info = {}
 
-# Если история есть: уточним для проигранных — с какого этапа свалились
 if history_info:
     fail_from_stage = {}
     for did, hist in history_info.items():
-        # берём последнюю запись в истории; для реального «провала» хорошо бы знать финальную семантику,
-        # но на практике последние 1-2 записи — это уже финальные статусы. Возьмём предпоследнюю как "откуда упали".
         if len(hist) >= 2:
             prev = hist.iloc[-2]["STAGE_ID"]
             fail_from_stage[did] = name_map.get(str(prev), str(prev))
@@ -525,24 +555,28 @@ if history_info:
 else:
     df["fail_from_stage_hist"] = np.nan
 
-# ============ Фильтр по отделам ============
+# ============ Фильтр по отделам (с сохранением) ============
 st.sidebar.title("Отделы / сотрудники")
 departments = bx_get_departments()
 sales_depts = [d for d in departments if "продаж" in (d.get("NAME","").lower())]
 sales_dept_ids = {int(d["ID"]) for d in sales_depts}
-default_sales_only = bool(sales_dept_ids)
+default_sales_only = True if sales_dept_ids else False
+ss_get("flt_sales_only", default_sales_only)
 
-sales_only = st.sidebar.checkbox("Только отдел продаж", value=default_sales_only)
 dept_options = [(int(d["ID"]), d["NAME"]) for d in departments]
-selected_depts = st.sidebar.multiselect(
-    "Выбор отделов",
-    options=dept_options,
-    default=[(int(d["ID"]), d["NAME"]) for d in sales_depts] if sales_only else [],
-    format_func=lambda t: t[1] if isinstance(t, tuple) else str(t)
-)
-selected_dept_ids = {t[0] for t in selected_depts} if selected_depts else (sales_dept_ids if sales_only else set())
+default_depts = [(int(d["ID"]), d["NAME"]) for d in sales_depts] if default_sales_only else []
+
+if "flt_depts" not in st.session_state:
+    st.session_state["flt_depts"] = default_depts
+
+st.sidebar.checkbox("Только отдел продаж", key="flt_sales_only")
+st.sidebar.multiselect("Выбор отделов", options=dept_options, key="flt_depts",
+                       default=default_depts, format_func=lambda t: t[1] if isinstance(t, tuple) else str(t))
+
+selected_dept_ids = {t[0] for t in st.session_state["flt_depts"]} if st.session_state["flt_depts"] else (sales_dept_ids if st.session_state["flt_sales_only"] else set())
 if selected_dept_ids:
-    keep_users = [uid for uid, info in users_full.items() if set(info["depts"]) & selected_dept_ids]
+    users_full_all = bx_get_users_full()
+    keep_users = [uid for uid, info in users_full_all.items() if set(info["depts"]) & selected_dept_ids]
     if keep_users:
         df = df[df["ASSIGNED_BY_ID"].isin(keep_users)]
 
@@ -633,7 +667,7 @@ with tab_over:
         st.plotly_chart(fig_funnel, use_container_width=True, key="ov_health_funnel")
     st.dataframe(dist.rename(columns={"Кол-во":"Кол-во (тек)"}), use_container_width=True)
 
-    # Воронки по этапам + «Провал»
+    # Воронки по этапам (без провалов)
     st.subheader("Воронки по этапам (без провалов) + «Провал» по причинам")
     for cat, title in [(CAT_MAIN, "Основная воронка продаж"), (CAT_PHYS, "Физ.Лица"), (CAT_LOW, "Не приоритетные сделки")]:
         sub = df[(df["cat_norm"]==cat) & (~df["is_fail"])]
@@ -645,20 +679,14 @@ with tab_over:
                 st.plotly_chart(fig_v, use_container_width=True, key=f"ov_funnel_{cat}")
             st.dataframe(stage[["stage_name","Количество"]].rename(columns={"stage_name":"Этап"}), use_container_width=True)
 
-    # Провалы: если есть история — берём fail_from_stage_hist, иначе текущий stage_name
+    # Провалы
     fails = df[df["is_fail"]].copy()
     fails["Причина"] = fails["stage_name"]
     fails["Этап (из истории)"] = fails["fail_from_stage_hist"]
-    if history_info:
-        grp_cols = ["category","Этап (из истории)","Причина"]
-    else:
-        grp_cols = ["category","stage_name","Причина"]
-        fails["Этап (из истории)"] = np.nan
-
     fails["Группа"] = fails["Причина"].map(failure_group)
     fail_by_reason = (fails.groupby(["category","Группа","Причина","Этап (из истории)"])["ID"].count()
                       .reset_index().rename(columns={"ID":"Количество"}))
-    with st.expander("Провал: причины по группам (с учётом истории стадий, если доступна)"):
+    with st.expander("Провал: причины по группам (история стадий, если доступна)"):
         if px and not fail_by_reason.empty:
             fig_fail = px.bar(fail_by_reason, x="Количество", y="Причина", color="Группа",
                               orientation="h", facet_col="category", height=520,
@@ -751,7 +779,6 @@ with tab_mgr:
                 fig = px.funnel(stages, y="stage_name", x="Кол-во", color_discrete_sequence=["#ff7a00"])
                 st.plotly_chart(fig, use_container_width=True, key=f"mgr_conv_funnel_{cat}")
         with right:
-            # если есть история — покажем на каком этапе чаще падает
             if history_info and "fail_from_stage_hist" in df.columns:
                 fails_by = sub[sub["is_fail"]].groupby("fail_from_stage_hist").size().reset_index(name="Кол-во")
                 fails_by = fails_by.rename(columns={"fail_from_stage_hist":"Этап (из истории)"}).sort_values("Кол-во", ascending=False)
@@ -764,9 +791,10 @@ with tab_mgr:
                 if fails.empty:
                     st.info("Провалов нет.")
                 else:
-                    st.dataframe(fails.rename(columns={"stage_name":"Причина","fail_group":"Группа"}), use_container_width=True)
-                    if px:
-                        figb = px.bar(fails, x="Кол-во", y="Причина", color="Группа", orientation="h")
+                    fails_plot = fails.rename(columns={"stage_name":"Причина","fail_group":"Группа"})
+                    st.dataframe(fails_plot[["Причина","Группа","Кол-во"]], use_container_width=True)
+                    if px and not fails_plot.empty:
+                        figb = px.bar(fails_plot, x="Кол-во", y="Причина", color="Группа", orientation="h")
                         st.plotly_chart(figb, use_container_width=True, key=f"mgr_conv_fail_{cat}")
 
 # =========================
@@ -806,13 +834,13 @@ with tab_ai:
             "micro_tasks": int(g["micro_tasks"].sum()),
         }
         if not PERPLEXITY_API_KEY:
-            return f"AI недоступен. Сводка: {summary}\n\nРекомендации:\n• Конкретизируйте задачи (цель/результат/дедлайн).\n• Не переносить дедлайны более 1 раза.\n• Контакт-ритм: 1 раз в 3–5 дней на активных стадиях.\n• Фиксируйте исходы контактов (звонок/письмо/встреча) в активности."
+            return f"AI недоступен. Сводка: {summary}\n\nРекомендации:\n• Конкретные задачи (цель/результат/дедлайн).\n• Не переносить дедлайны более 1 раза.\n• Контакт-ритм: 1 раз в 3–5 дней на активных стадиях.\n• Фиксировать исходы контактов (звонок/письмо/встреча) в активности."
         prompt = f"""
 Ты эксперт по CRM. Проанализируй работу менеджера "{mgr_name}".
 Данные: {summary}.
 1) Сильные стороны.
 2) Проблемные зоны.
-3) Чек-лист, чтобы здоровье сделок ≥70% и не падало (постановка задач, контроль сроков, контакт-ритм, фиксация договорённостей).
+3) Чек-лист, чтобы здоровье сделок ≥70% и не падало (задачи, сроки, контакт-ритм, фиксация договорённостей).
 4) Признаки «обхода системы» (переносы дедлайнов, микро-задачи) и что делать руководителю.
 Пиши кратко, деловым стилем.
 """
@@ -834,7 +862,8 @@ with tab_ai:
 # =========================
 with tab_plan:
     st.subheader("Годовой план по выручке — План/Факт/Прогноз")
-    year_plan = st.number_input("Целевой план на год, ₽", min_value=0, value=10_000_000, step=100_000, format="%d")
+    st.number_input("Целевой план на год, ₽", min_value=0, step=100_000, format="%d", key="flt_year_plan")
+    year_plan = st.session_state["flt_year_plan"] if st.session_state["flt_year_plan"] else 10_000_000
     this_year = datetime.now().year
 
     succ = df[(df["is_success"]) & (df["cat_norm"].isin({CAT_MAIN,CAT_PHYS,CAT_LOW}))].copy()
@@ -887,4 +916,4 @@ with tab_plan:
         st.plotly_chart(fig_plan, use_container_width=True, key="plan_fact_months")
 
 st.markdown("---")
-st.caption("БУРМАШ · CRM Дэшборд v5.2 — dealcategory.*, безопасная история стадий")
+st.caption("БУРМАШ · CRM Дэшборд v5.4 — сохранение фильтров, диапазон дат, фиксы")

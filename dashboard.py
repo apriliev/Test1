@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-БУРМАШ · CRM Дэшборд (v5.6)
-— Фикс ValueError в compute_health_scores (NaN в PROBABILITY/OPPORTUNITY).
-— Безопасные численные преобразования + клампинг.
-— Фильтры применяются ко всем метрикам (создание/закрытие/активность).
-— Сохранение фильтров, диапазон дат, отделы/сотрудники, античит-эвристики.
+БУРМАШ · CRM Дэшборд (v5.7)
+— Фикс TypeError в cheat_flags_for_deal (разные TZ/типы + пропуски) и безопасный мэппинг активностей.
+— Устойчивый расчёт потенциала (NaN/inf) и здоровье/проблемы/градация.
+— Фильтры: НИТ/Год/Квартал/Месяц/Неделя/Диапазон дат + сохранение в session_state.
+— Период корректно применяется к: созданию, закрытию и активности (разные подсчёты).
+— Выручка по 3 воронкам (успешные стадии), провалы с группами причин, отделы/сотрудники.
 — Без выгрузок/файлов. Авторизация: admin / admin123.
 """
 
@@ -309,7 +310,6 @@ def ts_with_prev(df, date_col, value_col, start, end, mode, agg="sum", freq_over
 
 # ============ Безопасные численные преобразования ============
 def safe_float(x, default=0.0):
-    """Возвращает float, но если NaN/inf/ошибка — default."""
     try:
         v = float(x)
         if np.isnan(v) or np.isinf(v):
@@ -345,7 +345,7 @@ def compute_health_scores(df, open_tasks_map, stuck_days=5):
         d_noact = days_between(now, last) or 0
         d_stage = days_between(now, begin_dt) or 0
 
-        has_task = len(open_tasks_map.get(int(r["ID"]), [])) > 0
+        has_task = len(open_tasks_map.get(int(safe_float(r.get("ID"), 0)), [])) > 0
 
         flags = {
             "no_company": int(safe_float(r.get("COMPANY_ID"), 0)) == 0,
@@ -370,15 +370,12 @@ def compute_health_scores(df, open_tasks_map, stuck_days=5):
         if opp <= 0:
             potential = 0
         else:
-            # вес от суммы: 30..100 (логарифмическая шкала, но с потолком)
             try:
                 opp_boost = 30 + min(70, math.log10(max(1.0, opp)) / 5.0 * 70.0)
             except ValueError:
                 opp_boost = 30.0
-            # вес от вероятности: 0.4..1.0
             prob_coef = 0.4 + (prob/100.0)*0.6
-            val = opp_boost * prob_coef
-            potential = int(clamp(round(val), 0, 100))
+            potential = int(clamp(round(opp_boost * prob_coef), 0, 100))
 
         rows.append({
             "ID": int(safe_float(r.get("ID"), 0)),
@@ -407,7 +404,6 @@ def compute_health_scores(df, open_tasks_map, stuck_days=5):
         })
     return pd.DataFrame(rows)
 
-def normalize_name(x): return str(x or "").strip().casefold()
 def is_failure_reason(stage_name):
     name = str(stage_name or "")
     return (name in FAIL_GROUP1) or (name in FAIL_GROUP2)
@@ -417,21 +413,53 @@ def failure_group(stage_name):
     if name in FAIL_GROUP2: return "Группа 2 (поздние этапы)"
     return "Прочее"
 
+# --- FIXED: устойчивый подсчёт переносов дедлайнов и «микро-задач»
 def cheat_flags_for_deal(acts):
-    if not acts: return {"reschedules":0, "micro_tasks":0}
+    """Эвристики обхода системы с защитой типов/TZ:
+    reschedules — переносы дедлайнов; micro_tasks — задачи ≤15 минут.
+    """
+    if not acts:
+        return {"reschedules": 0, "micro_tasks": 0}
+
     df = pd.DataFrame(acts)
+
+    def _to_naive(series):
+        s = pd.to_datetime(series, errors="coerce", utc=True)
+        try:
+            s = s.dt.tz_convert(None)
+        except Exception:
+            try:
+                s = s.dt.tz_localize(None)
+            except Exception:
+                pass
+        return s
+
     for col in ["CREATED","LAST_UPDATED","DEADLINE","START_TIME","END_TIME"]:
-        if col in df: df[col] = pd.to_datetime(df[col], errors="coerce")
+        if col in df.columns:
+            df[col] = _to_naive(df[col])
+
+    # Переносы дедлайна (по SUBJECT → уникальные дни DEADLINE)
     reschedules = 0
-    if "SUBJECT" in df.columns and "DEADLINE" in df.columns:
-        for _, g in df.groupby("SUBJECT"):
-            uniq = g["DEADLINE"].dropna().dt.floor("D").nunique()
-            if uniq > 1: reschedules += (uniq - 1)
+    if "DEADLINE" in df.columns:
+        tmp = df.dropna(subset=["DEADLINE"]).copy()
+        subj = tmp["SUBJECT"] if "SUBJECT" in tmp.columns else pd.Series([""] * len(tmp))
+        tmp["_deadline_day"] = tmp["DEADLINE"].dt.floor("D")
+        grp = pd.DataFrame({"SUBJECT": subj, "_deadline_day": tmp["_deadline_day"]})
+        for _, g in grp.groupby("SUBJECT"):
+            uniq = g["_deadline_day"].nunique()
+            if uniq and uniq > 1:
+                reschedules += int(uniq - 1)
+
+    # Микро-задачи (<= 15 минут)
     micro = 0
     if "START_TIME" in df.columns and "END_TIME" in df.columns:
-        dur = (df["END_TIME"] - df["START_TIME"]).dt.total_seconds() / 60.0
-        micro += int((dur.dropna() <= 15).sum())
-    return {"reschedules":int(reschedules), "micro_tasks":int(micro)}
+        st_ = df["START_TIME"]; en_ = df["END_TIME"]
+        mask = st_.notna() & en_.notna()
+        if mask.any():
+            dur_min = (en_[mask] - st_[mask]).dt.total_seconds() / 60.0
+            micro = int((dur_min <= 15).sum())
+
+    return {"reschedules": int(reschedules), "micro_tasks": int(micro)}
 
 # ============ Фильтры с сохранением ============
 def ss_get(k, default):
@@ -533,7 +561,6 @@ with st.spinner("Загружаю данные…"):
         st.error("Сделок не найдено за выбранный период."); st.stop()
     df_raw = pd.DataFrame(deals_raw)
 
-    # Числа → безопасно
     for c in ["OPPORTUNITY","PROBABILITY","ASSIGNED_BY_ID","COMPANY_ID","CONTACT_ID","CATEGORY_ID"]:
         df_raw[c] = pd.to_numeric(df_raw.get(c), errors="coerce")
 
@@ -564,16 +591,16 @@ df_all["is_success"] = df_all.apply(lambda r: (SUCCESS_NAME_BY_CAT.get(r["cat_no
 df_all["is_fail"]    = df_all["stage_name"].map(is_failure_reason)
 df_all["fail_group"] = df_all["stage_name"].map(failure_group)
 
-# Античит
-df_all["reschedules"] = df_all["ID"].map(lambda i: cheat_flags_for_deal(activities.get(int(i))).get("reschedules",0))
-df_all["micro_tasks"] = df_all["ID"].map(lambda i: cheat_flags_for_deal(activities.get(int(i))).get("micro_tasks",0))
+# Античит (фикс: безопасный дефолт [])
+df_all["reschedules"] = df_all["ID"].map(lambda i: cheat_flags_for_deal(activities.get(int(i), [])).get("reschedules", 0))
+df_all["micro_tasks"] = df_all["ID"].map(lambda i: cheat_flags_for_deal(activities.get(int(i), [])).get("micro_tasks", 0))
 df_all["cheat_flag"]  = (df_all["reschedules"]>=3) | (df_all["micro_tasks"]>=5)
 
 # История стадий
 history_info = {}
-if st.session_state["flt_use_history"]:
+if use_history:
     try:
-        history_raw = bx_get_stage_history_lite(df_all["ID"].astype(int).tolist(), max_deals=st.session_state["flt_history_limit"])
+        history_raw = bx_get_stage_history_lite(df_all["ID"].astype(int).tolist(), max_deals=history_limit)
         for did, items in history_raw.items():
             h = pd.DataFrame(items)
             if h.empty: 
@@ -637,7 +664,7 @@ def fmt_currency(x):
     except: return "0"
 
 st.markdown("<div class='headerbar'><div class='pill'>БУРМАШ · Контроль отдела продаж</div></div>", unsafe_allow_html=True)
-st.caption(f"Период: {start} → {end}. Динамика — к предыдущему периоду той же длины. Агрегация: {agg_label}. История стадий: {'вкл' if st.session_state['flt_use_history'] else 'выкл'}.")
+st.caption(f"Период: {start} → {end}. Динамика — к предыдущему периоду той же длины. Агрегация: {agg_label}. История стадий: {'вкл' if use_history else 'выкл'}.")
 
 # ============ Вкладки ============
 tab_over, tab_prob, tab_mgr, tab_grad, tab_time, tab_ai, tab_plan = st.tabs([
@@ -984,4 +1011,4 @@ with tab_plan:
         st.plotly_chart(fig_plan, use_container_width=True, key="plan_fact_months")
 
 st.markdown("---")
-st.caption("БУРМАШ · CRM Дэшборд v5.6 — устойчивый расчёт потенциала и фильтров")
+st.caption("БУРМАШ · CRM Дэшборд v5.7 — устойчивые активности и фильтры")

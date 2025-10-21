@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-БУРМАШ · CRM Дэшборд (v5.4)
-— Сохранение выбранных фильтров в st.session_state (переживают перезапуски/перерендеры в рамках сессии).
-— Кнопка «Сбросить фильтры».
-— Фильтр «Диапазон дат (с–по)».
-— Фикс графика «По менеджерам → Конверсия по этапам».
-— Источники: Bitrix24 (dealcategory.*, status.list, activity.list, user.get, department.get).
+БУРМАШ · CRM Дэшборд (v5.5)
+— Фильтры применяются ко всем метрикам: создание/закрытие/активность.
+— Двойная выборка сделок (DATE_CREATE и CLOSEDATE) => корректная выручка по закрытию.
+— Фикс ValueError в «Градация сделок».
+— Сохранение фильтров, диапазон дат, отделы/сотрудники, античит-эвристики.
 — Без выгрузок/файлов. Авторизация: admin / admin123.
 """
 
@@ -106,16 +105,29 @@ def _bx_get(method, params=None, pause=0.35):
     return out
 
 @st.cache_data(ttl=300)
-def bx_get_deals(date_from=None, date_to=None, limit=3000):
+def bx_get_deals_by_date(field_from, field_to, limit=3000):
+    """Загрузка сделок по одному полю даты (DATE_CREATE или CLOSEDATE)."""
     params = {"select[]":[
         "ID","TITLE","STAGE_ID","OPPORTUNITY","ASSIGNED_BY_ID","COMPANY_ID","CONTACT_ID",
         "PROBABILITY","DATE_CREATE","DATE_MODIFY","LAST_ACTIVITY_TIME","CATEGORY_ID",
         "BEGINDATE","CLOSEDATE","STAGE_SEMANTIC_ID"
     ]}
-    if date_from: params["filter[>=DATE_CREATE]"] = date_from
-    if date_to:   params["filter[<=DATE_CREATE]"] = date_to
+    if field_from: params[f"filter[>={field_from[0]}]"] = str(field_from[1])
+    if field_to:   params[f"filter[<={field_to[0]}]"]  = str(field_to[1])
     deals = _bx_get("crm.deal.list", params)
     return deals[:limit]
+
+@st.cache_data(ttl=300)
+def bx_get_deals_dual(start, end, limit=3000):
+    """Объединяем выборки: по DATE_CREATE и по CLOSEDATE — чтобы период работал «для всего»."""
+    created = bx_get_deals_by_date(("DATE_CREATE", start), ("DATE_CREATE", end), limit=limit)
+    closed  = bx_get_deals_by_date(("CLOSEDATE",  start), ("CLOSEDATE",  end), limit=limit)
+    by_id = {}
+    for r in created + closed:
+        by_id[int(r["ID"])] = r
+    # обрезаем до лимита для безопасности (по ID-упорядочению)
+    out = [by_id[k] for k in sorted(by_id.keys())][:limit]
+    return out
 
 @st.cache_data(ttl=600)
 def bx_get_categories():
@@ -369,25 +381,22 @@ def failure_group(stage_name):
     return "Прочее"
 
 def cheat_flags_for_deal(acts):
-    """Простая и надёжная эвристика «обходов»."""
     if not acts: return {"reschedules":0, "micro_tasks":0}
     df = pd.DataFrame(acts)
     for col in ["CREATED","LAST_UPDATED","DEADLINE","START_TIME","END_TIME"]:
         if col in df: df[col] = pd.to_datetime(df[col], errors="coerce")
-    # переносы дедлайнов по одному SUBJECT
     reschedules = 0
     if "SUBJECT" in df.columns and "DEADLINE" in df.columns:
         for _, g in df.groupby("SUBJECT"):
             uniq = g["DEADLINE"].dropna().dt.floor("D").nunique()
             if uniq > 1: reschedules += (uniq - 1)
-    # микро-задачи <=15 минут
     micro = 0
     if "START_TIME" in df.columns and "END_TIME" in df.columns:
         dur = (df["END_TIME"] - df["START_TIME"]).dt.total_seconds() / 60.0
         micro += int((dur.dropna() <= 15).sum())
     return {"reschedules":int(reschedules), "micro_tasks":int(micro)}
 
-# ============ Фильтры с сохранением состояния ============
+# ============ Фильтры с сохранением ============
 def ss_get(k, default):
     if k not in st.session_state: st.session_state[k] = default
     return st.session_state[k]
@@ -399,7 +408,7 @@ default_mode = ss_get("flt_mode", "НИТ")
 mode = st.sidebar.selectbox("Режим периода", mode_options,
                             index=mode_options.index(default_mode), key="flt_mode")
 
-# Значения по умолчанию для различных режимов
+# Значения по умолчанию
 ss_get("flt_nit_from", datetime.now().date()-timedelta(days=30))
 ss_get("flt_year", datetime.now().year)
 ss_get("flt_quarter", (datetime.now().month-1)//3 + 1)
@@ -434,22 +443,21 @@ st.sidebar.selectbox("Ось времени (агрегация)", ["Авто (�
 agg_freq = freq_from_label(st.session_state["flt_agg_label"])
 
 st.sidebar.slider("Нет активности ≥ (дней)", 2, 21, 5, key="flt_stuck_days")
-st.sidebar.slider("Лимит сделок (API)", 50, 3000, 1000, step=50, key="flt_limit")
+st.sidebar.slider("Лимит сделок (API)", 50, 3000, 1500, step=50, key="flt_limit")
 
 st.sidebar.title("История стадий (опционально)")
 st.sidebar.checkbox("Использовать историю стадий (если доступна)", value=True, key="flt_use_history")
 st.sidebar.slider("Макс. сделок для истории", 50, 800, 300, step=50, key="flt_history_limit")
 
-# Кнопка сброса фильтров
+# Сброс фильтров
 def reset_filters():
     for k in list(st.session_state.keys()):
         if k.startswith("flt_"):
             del st.session_state[k]
     st.rerun()
-
 st.sidebar.button("↺ Сбросить фильтры", on_click=reset_filters, key="flt_reset_btn")
 
-# Считываем значения для расчётов
+# Чтение значений
 mode = st.session_state["flt_mode"]
 agg_label = st.session_state["flt_agg_label"]
 stuck_days = st.session_state["flt_stuck_days"]
@@ -457,7 +465,7 @@ limit = st.session_state["flt_limit"]
 use_history = st.session_state["flt_use_history"]
 history_limit = st.session_state["flt_history_limit"]
 
-# Преобразуем в period_range
+# Преобразуем в период
 if mode == "НИТ":
     start_input = st.session_state["flt_nit_from"]; end_input=None
     year=quarter=month=iso_week=None
@@ -477,56 +485,57 @@ else:  # Диапазон дат
     start_input = st.session_state["flt_range_from"]; end_input = st.session_state["flt_range_to"]
     year=quarter=month=iso_week=None
 
+start, end = period_range(mode, start_date=start_input, end_date=end_input, year=year, quarter=quarter, month=month, iso_week=iso_week)
+
 # ============ Загрузка данных ============
 with st.spinner("Загружаю данные…"):
     if not BITRIX24_WEBHOOK:
         st.error("Не указан BITRIX24_WEBHOOK в Secrets."); st.stop()
-    start, end = period_range(mode, start_date=start_input, end_date=end_input, year=year, quarter=quarter, month=month, iso_week=iso_week)
 
-    deals_raw = bx_get_deals(str(start), str(end), limit=limit)
+    # 1) Грузим сделки по DATE_CREATE и по CLOSEDATE, объединяем:
+    deals_raw = bx_get_deals_dual(start, end, limit=limit)
     if not deals_raw:
         st.error("Сделок не найдено за выбранный период."); st.stop()
     df_raw = pd.DataFrame(deals_raw)
-    df_raw["OPPORTUNITY"] = pd.to_numeric(df_raw.get("OPPORTUNITY"), errors="coerce").fillna(0.0)
-
+    for c in ["OPPORTUNITY","PROBABILITY","ASSIGNED_BY_ID","COMPANY_ID","CONTACT_ID","CATEGORY_ID"]:
+        df_raw[c] = pd.to_numeric(df_raw.get(c), errors="coerce")
     users_full   = bx_get_users_full()
     users_map    = {uid: users_full[uid]["name"] for uid in users_full}
     categories   = bx_get_categories()
-    activities   = bx_get_activities(df_raw["ID"].tolist(), include_completed=True)
+    activities   = bx_get_activities(df_raw["ID"].astype(int).tolist(), include_completed=True)
 
-# Основная таблица
-df = compute_health_scores(df_raw, {k:v for k,v in activities.items() if v}, stuck_days=stuck_days)
+# 2) Скоринг по всем загруженным сделкам (df_all)
+df_all = compute_health_scores(df_raw, {k:v for k,v in activities.items() if v}, stuck_days=stuck_days)
 
-# Карта стадий
-cat_ids   = df["CATEGORY_ID"].dropna().astype(int).unique().tolist()
+# 3) Карта стадий
+cat_ids   = df_all["CATEGORY_ID"].dropna().astype(int).unique().tolist()
 sort_map, name_map = bx_get_stage_map_by_category(cat_ids)
-
 FALLBACK_ORDER = ["NEW","NEW_LEAD","PREPARATION","PREPAYMENT_INVOICE","EXECUTING","FINAL_INVOICE","WON","LOSE"]
 def fallback_sort(sid):
     sid = str(sid or ""); sid_short = sid.split(":")[1] if ":" in sid else sid
     return (FALLBACK_ORDER.index(sid_short)*100 if sid_short in FALLBACK_ORDER else 10000 + hash(sid_short)%1000)
 
-df["stage_sort"] = df["STAGE_ID"].map(lambda s: sort_map.get(str(s), fallback_sort(s)))
-df["stage_name"] = df["STAGE_ID"].map(lambda s: name_map.get(str(s), str(s)))
-df["manager"]    = df["ASSIGNED_BY_ID"].map(users_map).fillna("Неизвестно")
-df["category"]   = df["CATEGORY_ID"].map(lambda x: categories.get(int(x or 0), "Воронка"))
-df["cat_norm"]   = df["category"].map(lambda x: str(x or "").strip().casefold())
+df_all["stage_sort"] = df_all["STAGE_ID"].map(lambda s: sort_map.get(str(s), fallback_sort(s)))
+df_all["stage_name"] = df_all["STAGE_ID"].map(lambda s: name_map.get(str(s), str(s)))
+df_all["manager"]    = df_all["ASSIGNED_BY_ID"].map(users_map).fillna("Неизвестно")
+df_all["category"]   = df_all["CATEGORY_ID"].map(lambda x: categories.get(int(x or 0), "Воронка"))
+df_all["cat_norm"]   = df_all["category"].map(lambda x: str(x or "").strip().casefold())
 
-# Флаги успех/провал
-df["is_success"] = df.apply(lambda r: (SUCCESS_NAME_BY_CAT.get(r["cat_norm"]) == r["stage_name"]), axis=1)
-df["is_fail"]    = df["stage_name"].map(is_failure_reason)
-df["fail_group"] = df["stage_name"].map(failure_group)
+# Успех/провал
+df_all["is_success"] = df_all.apply(lambda r: (SUCCESS_NAME_BY_CAT.get(r["cat_norm"]) == r["stage_name"]), axis=1)
+df_all["is_fail"]    = df_all["stage_name"].map(is_failure_reason)
+df_all["fail_group"] = df_all["stage_name"].map(failure_group)
 
-# Обходы
-df["reschedules"] = df["ID"].map(lambda i: cheat_flags_for_deal(activities.get(int(i))).get("reschedules",0))
-df["micro_tasks"] = df["ID"].map(lambda i: cheat_flags_for_deal(activities.get(int(i))).get("micro_tasks",0))
-df["cheat_flag"]  = (df["reschedules"]>=3) | (df["micro_tasks"]>=5)
+# Античит
+df_all["reschedules"] = df_all["ID"].map(lambda i: cheat_flags_for_deal(activities.get(int(i))).get("reschedules",0))
+df_all["micro_tasks"] = df_all["ID"].map(lambda i: cheat_flags_for_deal(activities.get(int(i))).get("micro_tasks",0))
+df_all["cheat_flag"]  = (df_all["reschedules"]>=3) | (df_all["micro_tasks"]>=5)
 
-# (Опционально) История стадий
+# История стадий (опционально)
 history_info = {}
 if use_history:
     try:
-        history_raw = bx_get_stage_history_lite(df["ID"].tolist(), max_deals=history_limit)
+        history_raw = bx_get_stage_history_lite(df_all["ID"].astype(int).tolist(), max_deals=history_limit)
         for did, items in history_raw.items():
             h = pd.DataFrame(items)
             if h.empty: 
@@ -544,43 +553,47 @@ if use_history:
             history_info[did] = h[["STAGE_ID", tcol]].rename(columns={tcol:"TS"})
     except Exception:
         history_info = {}
-
 if history_info:
     fail_from_stage = {}
     for did, hist in history_info.items():
         if len(hist) >= 2:
             prev = hist.iloc[-2]["STAGE_ID"]
             fail_from_stage[did] = name_map.get(str(prev), str(prev))
-    df["fail_from_stage_hist"] = df["ID"].map(fail_from_stage)
+    df_all["fail_from_stage_hist"] = df_all["ID"].map(fail_from_stage)
 else:
-    df["fail_from_stage_hist"] = np.nan
+    df_all["fail_from_stage_hist"] = np.nan
 
-# ============ Фильтр по отделам (с сохранением) ============
+# ============ Фильтр по отделам ============
 st.sidebar.title("Отделы / сотрудники")
 departments = bx_get_departments()
 sales_depts = [d for d in departments if "продаж" in (d.get("NAME","").lower())]
 sales_dept_ids = {int(d["ID"]) for d in sales_depts}
-default_sales_only = True if sales_dept_ids else False
-ss_get("flt_sales_only", default_sales_only)
+ss_get("flt_sales_only", True if sales_dept_ids else False)
 
 dept_options = [(int(d["ID"]), d["NAME"]) for d in departments]
-default_depts = [(int(d["ID"]), d["NAME"]) for d in sales_depts] if default_sales_only else []
-
+default_depts = [(int(d["ID"]), d["NAME"]) for d in sales_depts] if st.session_state["flt_sales_only"] else []
 if "flt_depts" not in st.session_state:
     st.session_state["flt_depts"] = default_depts
-
 st.sidebar.checkbox("Только отдел продаж", key="flt_sales_only")
 st.sidebar.multiselect("Выбор отделов", options=dept_options, key="flt_depts",
                        default=default_depts, format_func=lambda t: t[1] if isinstance(t, tuple) else str(t))
-
 selected_dept_ids = {t[0] for t in st.session_state["flt_depts"]} if st.session_state["flt_depts"] else (sales_dept_ids if st.session_state["flt_sales_only"] else set())
 if selected_dept_ids:
     users_full_all = bx_get_users_full()
     keep_users = [uid for uid, info in users_full_all.items() if set(info["depts"]) & selected_dept_ids]
     if keep_users:
-        df = df[df["ASSIGNED_BY_ID"].isin(keep_users)]
+        df_all = df_all[df_all["ASSIGNED_BY_ID"].isin(keep_users)]
 
-# ============ Шапка ============
+# ============ Поднаборы по периоду ============
+m_created = df_all["DATE_CREATE"].dt.date.between(start, end)
+m_closed  = df_all["CLOSEDATE"].dt.date.between(start, end)
+m_modify  = df_all["DATE_MODIFY"].dt.date.between(start, end)
+
+df_created = df_all[m_created].copy()   # для "Сделки"
+df_closed  = df_all[m_closed].copy()    # для "Выручка" и закрытых метрик
+df_mod     = df_all[m_modify].copy()    # для здоровья/проблем/градации/визуализаций
+
+# Шапка
 def fmt_currency(x):
     try: return f"{int(x):,}".replace(","," ")
     except: return "0"
@@ -599,22 +612,31 @@ tab_over, tab_prob, tab_mgr, tab_grad, tab_time, tab_ai, tab_plan = st.tabs([
 with tab_over:
     st.subheader("Суммарные показатели")
 
-    ts_deals = ts_with_prev(df.assign(dc=pd.to_datetime(df["DATE_CREATE"])), "dc", "ID", start, end, mode, agg="count", freq_override=agg_freq)
+    # Сделки — считаем по дате создания
+    ts_deals = ts_with_prev(df_created.assign(dc=pd.to_datetime(df_created["DATE_CREATE"])), "dc", "ID",
+                            start, end, mode, agg="count", freq_override=agg_freq)
 
+    # Выручка — считаем по дате закрытия и только по 3 нужным воронкам
     target_cats = {CAT_MAIN, CAT_PHYS, CAT_LOW}
-    df_succ = df[(df["is_success"]) & (df["cat_norm"].isin(target_cats))].copy()
-    df_succ["rev_date"] = df_succ["CLOSEDATE"].fillna(df_succ["DATE_MODIFY"])
-    ts_rev_total = ts_with_prev(df_succ.assign(rd=pd.to_datetime(df_succ["rev_date"])), "rd", "OPPORTUNITY", start, end, mode, agg="sum", freq_override=agg_freq)
+    df_succ_closed = df_closed[(df_closed["is_success"]) & (df_closed["cat_norm"].isin(target_cats))].copy()
+    df_succ_closed["rev_date"] = df_succ_closed["CLOSEDATE"].fillna(df_succ_closed["DATE_MODIFY"])
+
+    ts_rev_total = ts_with_prev(df_succ_closed.assign(rd=pd.to_datetime(df_succ_closed["rev_date"])), "rd", "OPPORTUNITY",
+                                start, end, mode, agg="sum", freq_override=agg_freq)
 
     per_cat = []
     for cat in [CAT_MAIN, CAT_PHYS, CAT_LOW]:
-        part = df_succ[df_succ["cat_norm"]==cat].copy()
-        ts = ts_with_prev(part.assign(rd=pd.to_datetime(part["rev_date"])), "rd", "OPPORTUNITY", start, end, mode, agg="sum", freq_override=agg_freq)
+        part = df_succ_closed[df_succ_closed["cat_norm"]==cat].copy()
+        ts = ts_with_prev(part.assign(rd=pd.to_datetime(part["rev_date"])), "rd", "OPPORTUNITY",
+                          start, end, mode, agg="sum", freq_override=agg_freq)
         ts["cat"] = cat; per_cat.append(ts)
     ts_rev_by_cat = pd.concat(per_cat, ignore_index=True) if per_cat else pd.DataFrame(columns=["period","value","prev_value","cat"])
 
-    ts_health = ts_with_prev(df.assign(dm=pd.to_datetime(df["DATE_MODIFY"])), "dm", "health", start, end, mode, agg="mean", freq_override=agg_freq)
-    ts_poten  = ts_with_prev(df.assign(dm=pd.to_datetime(df["DATE_MODIFY"])), "dm", "potential", start, end, mode, agg="mean", freq_override=agg_freq)
+    # Среднее здоровье/потенциал — по активности (DATE_MODIFY) внутри периода
+    ts_health = ts_with_prev(df_mod.assign(dm=pd.to_datetime(df_mod["DATE_MODIFY"])), "dm", "health",
+                             start, end, mode, agg="mean", freq_override=agg_freq)
+    ts_poten  = ts_with_prev(df_mod.assign(dm=pd.to_datetime(df_mod["DATE_MODIFY"])), "dm", "potential",
+                             start, end, mode, agg="mean", freq_override=agg_freq)
 
     def delta_str(cur_prev_df, agg="sum"):
         if cur_prev_df.empty: return "0", "0%"
@@ -632,12 +654,12 @@ with tab_over:
     val, delta = delta_str(ts_poten, agg="mean"); c4.metric("Средний потенциал, %", val, delta)
 
     if px:
-        st.markdown("###### Линия: количество сделок")
+        st.markdown("###### Линия: количество сделок (по дате создания)")
         fig_d = px.line(ts_deals, x="period", y="value", markers=True, labels={"value":"Кол-во","period":"Период"})
         fig_d.add_scatter(x=ts_deals["period"], y=ts_deals["prev_value"], mode="lines", name="Пред. период", line=dict(dash="dash"))
         st.plotly_chart(fig_d, use_container_width=True, key="ov_deals_ts")
 
-        st.markdown("###### Линия: выручка по воронкам")
+        st.markdown("###### Линия: выручка (по дате закрытия) по воронкам")
         if not ts_rev_by_cat.empty:
             fig_r = px.line(ts_rev_by_cat, x="period", y="value", color="cat",
                             labels={"value":"Выручка, ₽","period":"Период","cat":"Воронка"},
@@ -645,7 +667,7 @@ with tab_over:
             fig_r.add_scatter(x=ts_rev_total["period"], y=ts_rev_total["prev_value"], name="Сумма (пред.)", line=dict(dash="dash"))
             st.plotly_chart(fig_r, use_container_width=True, key="ov_revenue_bycat")
 
-        st.markdown("###### Линии: среднее здоровье и потенциал")
+        st.markdown("###### Линии: среднее здоровье и потенциал (по дате изменения)")
         colA, colB = st.columns(2)
         with colA:
             fig_h = px.line(ts_health, x="period", y="value", markers=True, labels={"value":"Здоровье %","period":"Период"})
@@ -656,21 +678,20 @@ with tab_over:
             fig_p.add_scatter(x=ts_poten["period"], y=ts_poten["prev_value"], mode="lines", name="Пред. период", line=dict(dash="dash"))
             st.plotly_chart(fig_p, use_container_width=True, key="ov_potential_ts")
 
-    # Распределение здоровья
+    # Распределение здоровья (по активности)
     st.subheader("Распределение здоровья (шаг 5%)")
     bins = list(range(0, 105, 5))
-    work = df[(df["DATE_MODIFY"].dt.date.between(start,end))]
-    hist = pd.cut(work["health"], bins=bins, right=False).value_counts().sort_index()
+    hist = pd.cut(df_mod["health"], bins=bins, right=False).value_counts().sort_index()
     dist = pd.DataFrame({"Диапазон": hist.index.astype(str), "Кол-во": hist.values})
     if px and not dist.empty:
         fig_funnel = px.funnel(dist, y="Диапазон", x="Кол-во", color_discrete_sequence=["#ff7a00"])
         st.plotly_chart(fig_funnel, use_container_width=True, key="ov_health_funnel")
     st.dataframe(dist.rename(columns={"Кол-во":"Кол-во (тек)"}), use_container_width=True)
 
-    # Воронки по этапам (без провалов)
+    # Воронки по этапам (без провалов) — считаем по сделкам СОЗДАННЫМ в период
     st.subheader("Воронки по этапам (без провалов) + «Провал» по причинам")
     for cat, title in [(CAT_MAIN, "Основная воронка продаж"), (CAT_PHYS, "Физ.Лица"), (CAT_LOW, "Не приоритетные сделки")]:
-        sub = df[(df["cat_norm"]==cat) & (~df["is_fail"])]
+        sub = df_created[(df_created["cat_norm"]==cat) & (~df_created["is_fail"])]
         stage = (sub.groupby(["STAGE_ID","stage_name","stage_sort"])["ID"].count()
                  .reset_index().rename(columns={"ID":"Количество"}).sort_values("stage_sort"))
         with st.expander(f"Воронка: {title}"):
@@ -679,8 +700,8 @@ with tab_over:
                 st.plotly_chart(fig_v, use_container_width=True, key=f"ov_funnel_{cat}")
             st.dataframe(stage[["stage_name","Количество"]].rename(columns={"stage_name":"Этап"}), use_container_width=True)
 
-    # Провалы
-    fails = df[df["is_fail"]].copy()
+    # Провалы (по активности)
+    fails = df_mod[df_mod["is_fail"]].copy()
     fails["Причина"] = fails["stage_name"]
     fails["Этап (из истории)"] = fails["fail_from_stage_hist"]
     fails["Группа"] = fails["Причина"].map(failure_group)
@@ -695,16 +716,16 @@ with tab_over:
         st.dataframe(fail_by_reason.rename(columns={"category":"Воронка"}), use_container_width=True)
 
 # =========================
-# ПРОБЛЕМЫ
+# ПРОБЛЕМЫ (по активности)
 # =========================
 with tab_prob:
-    st.subheader("Метрики проблем")
+    st.subheader("Метрики проблем (DATE_MODIFY в период)")
     problems = {
-        "Без задач": int(df["flag_no_tasks"].sum()),
-        "Без компании": int(df["flag_no_company"].sum()),
-        "Без контакта": int(df["flag_no_contact"].sum()),
-        "Застряли": int(df["flag_stuck"].sum()),
-        "Проиграны": int(df["is_fail"].sum()),
+        "Без задач": int(df_mod["flag_no_tasks"].sum()),
+        "Без компании": int(df_mod["flag_no_company"].sum()),
+        "Без контакта": int(df_mod["flag_no_contact"].sum()),
+        "Застряли": int(df_mod["flag_stuck"].sum()),
+        "Проиграны": int(df_mod["is_fail"].sum()),
     }
     a,b,c,d,e = st.columns(5)
     a.metric("Без задач", problems["Без задач"])
@@ -716,7 +737,7 @@ with tab_prob:
     st.subheader("Распределение проблем по времени")
     if px:
         def build_problem_ts(mask_col):
-            tmp = df.assign(dm=pd.to_datetime(df["DATE_MODIFY"]))
+            tmp = df_mod.assign(dm=pd.to_datetime(df_mod["DATE_MODIFY"]))
             tmp[mask_col] = tmp[mask_col].astype(int)
             return ts_with_prev(tmp, "dm", mask_col, start, end, mode, agg="sum", freq_override=agg_freq)
         lines = []
@@ -729,28 +750,31 @@ with tab_prob:
         fig.add_scatter(x=base_prev["period"], y=base_prev["prev_value"], name="Пред. период (сумма)", line=dict(dash="dash"))
         st.plotly_chart(fig, use_container_width=True, key="prob_lines")
 
-    st.subheader("Списки по видам проблем")
+    st.subheader("Списки по видам проблем (DATE_MODIFY в период)")
     cols = st.columns(5)
-    masks = [("Без задач", df["flag_no_tasks"]),("Без контакта", df["flag_no_contact"]),
-             ("Без компании", df["flag_no_company"]),("Застряли", df["flag_stuck"]),("Проиграны", df["is_fail"])]
+    masks = [("Без задач", df_mod["flag_no_tasks"]),("Без контакта", df_mod["flag_no_contact"]),
+             ("Без компании", df_mod["flag_no_company"]),("Застряли", df_mod["flag_stuck"]),("Проиграны", df_mod["is_fail"])]
     for (title, mask), box in zip(masks, cols):
         with box:
             st.markdown(f"<div class='card'><div class='title'>{title}</div>", unsafe_allow_html=True)
-            st.dataframe(df[mask][["ID","TITLE","manager","stage_name","OPPORTUNITY","health","days_no_activity"]],
+            st.dataframe(df_mod[mask][["ID","TITLE","manager","stage_name","OPPORTUNITY","health","days_no_activity"]],
                          use_container_width=True, height=260)
             st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================
-# ПО МЕНЕДЖЕРАМ
+# ПО МЕНЕДЖЕРАМ (по активности)
 # =========================
 with tab_mgr:
-    st.subheader("Аналитика по менеджерам (3 воронки и стадии провала)")
-    succ = df[(df["is_success"]) & (df["cat_norm"].isin({CAT_MAIN,CAT_PHYS,CAT_LOW}))].copy()
+    st.subheader("Аналитика по менеджерам (актуальные сделки в период, DATE_MODIFY)")
+    # Выиграно/Выручка — считаем по закрытым в период (df_closed)
+    succ = df_closed[(df_closed["is_success"]) & (df_closed["cat_norm"].isin({CAT_MAIN,CAT_PHYS,CAT_LOW}))].copy()
     succ["rev_date"] = succ["CLOSEDATE"].fillna(succ["DATE_MODIFY"])
     won_cnt = succ.groupby("manager")["ID"].count().rename("Выиграно").reset_index()
     won_sum = succ.groupby("manager")["OPPORTUNITY"].sum().rename("Выручка, ₽").reset_index()
-    lost_cnt = df[df["is_fail"]].groupby("manager")["ID"].count().rename("Проиграно").reset_index()
-    base = df.groupby("manager").agg(Сделок=("ID","count"), СрЗдоровье=("health","mean")).reset_index()
+    # Проиграно — берём провалы, изменённые в период (df_mod)
+    lost_cnt = df_mod[df_mod["is_fail"]].groupby("manager")["ID"].count().rename("Проиграно").reset_index()
+    # База — активные/все в период (df_mod)
+    base = df_mod.groupby("manager").agg(Сделок=("ID","count"), СрЗдоровье=("health","mean")).reset_index()
     mgr = base.merge(won_cnt, on="manager", how="left").merge(won_sum, on="manager", how="left").merge(lost_cnt, on="manager", how="left")
     mgr[["Выиграно","Выручка, ₽","Проиграно"]] = mgr[["Выиграно","Выручка, ₽","Проиграно"]].fillna(0)
     mgr["Конверсия в победу, %"] = (mgr["Выиграно"]/mgr["Сделок"]*100).round(1).replace([np.inf,np.nan],0)
@@ -766,8 +790,9 @@ with tab_mgr:
         st.plotly_chart(fig2, use_container_width=True, key="mgr_scatter")
 
     st.subheader("Конверсия по этапам (читабельно)")
+    # Используем активность периода (df_mod) + история, если есть
     for cat, title in [(CAT_MAIN,"Основная воронка продаж"), (CAT_PHYS,"Физ.Лица"), (CAT_LOW,"Не приоритетные сделки")]:
-        sub = df[df["cat_norm"]==cat]
+        sub = df_mod[df_mod["cat_norm"]==cat]
         st.markdown(f"**{title}**")
         left, right = st.columns(2)
         with left:
@@ -779,7 +804,7 @@ with tab_mgr:
                 fig = px.funnel(stages, y="stage_name", x="Кол-во", color_discrete_sequence=["#ff7a00"])
                 st.plotly_chart(fig, use_container_width=True, key=f"mgr_conv_funnel_{cat}")
         with right:
-            if history_info and "fail_from_stage_hist" in df.columns:
+            if history_info and "fail_from_stage_hist" in df_all.columns:
                 fails_by = sub[sub["is_fail"]].groupby("fail_from_stage_hist").size().reset_index(name="Кол-во")
                 fails_by = fails_by.rename(columns={"fail_from_stage_hist":"Этап (из истории)"}).sort_values("Кол-во", ascending=False)
                 st.dataframe(fails_by, use_container_width=True)
@@ -801,10 +826,12 @@ with tab_mgr:
 # ГРАДАЦИЯ / ВРЕМЯ / AI
 # =========================
 with tab_grad:
-    st.subheader("Градация сделок (как было)")
-    quick = df[(~df["is_fail"]) & (df["PROBABILITY"]>=50) & (df["health"]>=60)].copy()
-    work  = df[(~df["is_fail"]) & ~quick.index.isin(quick.index)]
-    drop  = df[df["is_fail"]]
+    st.subheader("Градация сделок (DATE_MODIFY в период)")
+    # Быстрые победы
+    quick = df_mod[(~df_mod["is_fail"]) & (df_mod["PROBABILITY"]>=50) & (df_mod["health"]>=60)].copy()
+    # Остальные в работе — корректный фикс (исключаем quick по индексу df_mod, а не по df_all)
+    work  = df_mod[(~df_mod["is_fail"]) & (~df_mod.index.isin(quick.index))].copy()
+    drop  = df_mod[df_mod["is_fail"]]
     c1,c2,c3 = st.columns(3)
     c1.metric("🟢 Quick Wins", len(quick), fmt_currency(quick["OPPORTUNITY"].sum())+" ₽")
     c2.metric("🟡 Проработка", len(work), fmt_currency(work["OPPORTUNITY"].sum())+" ₽")
@@ -815,12 +842,12 @@ with tab_grad:
         st.dataframe(drop[["ID","TITLE","manager","stage_name","OPPORTUNITY"]].rename(columns={"OPPORTUNITY":"Сумма"}), use_container_width=True)
 
 with tab_time:
-    st.subheader("Время на этапах (как было)")
-    stage_time = df.groupby("stage_name").agg(СрДней=("days_on_stage","mean"), Мин=("days_on_stage","min"), Макс=("days_on_stage","max")).round(1).reset_index()
+    st.subheader("Время на этапах (DATE_MODIFY в период)")
+    stage_time = df_mod.groupby("stage_name").agg(СрДней=("days_on_stage","mean"), Мин=("days_on_stage","min"), Макс=("days_on_stage","max")).round(1).reset_index()
     st.dataframe(stage_time.rename(columns={"stage_name":"Этап"}), use_container_width=True)
 
 with tab_ai:
-    st.subheader("🤖 AI-аналитика")
+    st.subheader("🤖 AI-аналитика (DATE_MODIFY в период)")
     st.caption("Рекомендации как держать здоровье ≥70% + поиск «обходов» (переносы дедлайнов, микро-задачи).")
     def ai_block(mgr_name, g):
         summary = {
@@ -853,12 +880,12 @@ with tab_ai:
             return resp.json()["choices"][0]["message"]["content"]
         except Exception as e:
             return f"AI ошибка: {e}"
-    for mgr_name, g in df.groupby("manager"):
+    for mgr_name, g in df_mod.groupby("manager"):
         with st.expander(f"👤 {mgr_name} ({len(g)} сделок)"):
             st.markdown(ai_block(mgr_name, g))
 
 # =========================
-# ПЛАН/ФАКТ
+# ПЛАН/ФАКТ (как было; ориентируемся на текущий календарный год)
 # =========================
 with tab_plan:
     st.subheader("Годовой план по выручке — План/Факт/Прогноз")
@@ -866,10 +893,10 @@ with tab_plan:
     year_plan = st.session_state["flt_year_plan"] if st.session_state["flt_year_plan"] else 10_000_000
     this_year = datetime.now().year
 
-    succ = df[(df["is_success"]) & (df["cat_norm"].isin({CAT_MAIN,CAT_PHYS,CAT_LOW}))].copy()
-    succ["rev_date"] = succ["CLOSEDATE"].fillna(succ["DATE_MODIFY"])
-    succ["year"] = pd.to_datetime(succ["rev_date"]).dt.year
-    succ_y = succ[succ["year"]==this_year].copy()
+    succ_y = df_all[(df_all["is_success"]) & (df_all["cat_norm"].isin({CAT_MAIN,CAT_PHYS,CAT_LOW}))].copy()
+    succ_y["rev_date"] = succ_y["CLOSEDATE"].fillna(succ_y["DATE_MODIFY"])
+    succ_y["year"] = pd.to_datetime(succ_y["rev_date"]).dt.year
+    succ_y = succ_y[succ_y["year"]==this_year].copy()
     succ_y["month"] = pd.to_datetime(succ_y["rev_date"]).dt.month
     succ_y["quarter"] = ((succ_y["month"]-1)//3 + 1)
 
@@ -884,7 +911,7 @@ with tab_plan:
     need_per_month = (remaining / months_left) if months_left>0 else 0.0
     pct_year = (fact_year / year_plan * 100.0) if year_plan>0 else 0.0
 
-    open_pipe = df[(~df["is_success"]) & (~df["is_fail"])]
+    open_pipe = df_all[(~df_all["is_success"]) & (~df_all["is_fail"])]
     forecast_add = float((open_pipe["OPPORTUNITY"] * open_pipe["PROBABILITY"]/100.0).sum())
     forecast_year = fact_year + forecast_add
 
@@ -916,4 +943,4 @@ with tab_plan:
         st.plotly_chart(fig_plan, use_container_width=True, key="plan_fact_months")
 
 st.markdown("---")
-st.caption("БУРМАШ · CRM Дэшборд v5.4 — сохранение фильтров, диапазон дат, фиксы")
+st.caption("БУРМАШ · CRM Дэшборд v5.5 — корректное применение фильтров + фиксы")
